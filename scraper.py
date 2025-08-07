@@ -1,11 +1,18 @@
 import re
 import asyncio
-from playwright.async_api import async_playwright
-from bs4 import BeautifulSoup
-import aiohttp
-from cache import get_cached_result, store_result
 from typing import Optional, Dict, Any, List
 import base64
+import aiohttp
+from bs4 import BeautifulSoup
+from cache import get_cached_result, store_result
+
+# Try to import Playwright, but continue without it if not available
+try:
+    from playwright.async_api import async_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+    print("Warning: Playwright not available, using requests fallback for all states")
 
 # Complete state configurations with license formats and verification URLs
 STATE_CONFIGS = {
@@ -15,7 +22,8 @@ STATE_CONFIGS = {
         "type": "General Contractor",
         "format": "5 digits",
         "url": "https://genconbd.alabama.gov/DATABASE-SQL/roster.aspx",
-        "method": "playwright"
+        "method": "playwright",
+        "fallback_url": "https://genconbd.alabama.gov/DATABASE-SQL/roster.aspx"
     },
     "AK": {
         "regex": r"^\d{6}$",
@@ -446,28 +454,137 @@ def validate_license_format(state: str, license_number: str) -> Dict[str, Any]:
         "notes": config.get("notes")
     }
 
-async def scrape_with_playwright(state: str, config: Dict, license_number: str, business_name: Optional[str] = None) -> Dict[str, Any]:
-    """Generic Playwright scraping function"""
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=['--no-sandbox', '--disable-blink-features=AutomationControlled']
-        )
-        
-        # Use different user agents and headers based on state requirements
-        user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        extra_headers = {}
-        
-        if state == "CA":
-            extra_headers['Referer'] = 'https://www.cslb.ca.gov/'
-        
-        context = await browser.new_context(
-            user_agent=user_agent,
-            extra_http_headers=extra_headers
-        )
-        page = await context.new_page()
-        
+async def scrape_with_requests_fallback(state: str, config: Dict, license_number: str, business_name: Optional[str] = None) -> Dict[str, Any]:
+    """Fallback HTTP requests method when Playwright is not available"""
+    async with aiohttp.ClientSession() as session:
         try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'DNT': '1',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1',
+            }
+            
+            # For Playwright-only sites, try to get the page content first
+            if config["method"] == "playwright":
+                # Just fetch the page and try to extract any useful info
+                async with session.get(config["url"], headers=headers) as response:
+                    html_content = await response.text()
+                
+                # Basic text analysis for license information
+                content_lower = html_content.lower()
+                
+                # Look for the license number in the page content
+                if license_number.lower() in content_lower:
+                    status = "Found"
+                    message = f"License number {license_number} found on {state} verification page"
+                else:
+                    status = "Not Found"
+                    message = f"License number {license_number} not found on {state} verification page"
+                
+                return {
+                    "status": status,
+                    "license_number": license_number,
+                    "business_name": business_name or "Unknown",
+                    "issuing_authority": f"{state} {config.get('type', 'Licensing Board')}",
+                    "expires": "Unknown",
+                    "verified": False,
+                    "verification_url": config["url"],
+                    "method_used": "requests_fallback",
+                    "message": message,
+                    "note": "Playwright not available - using basic page analysis"
+                }
+            
+            # For requests-compatible sites, try form submission
+            else:
+                # Prepare form data based on state
+                if state == "FL":
+                    form_data = {
+                        'licnbr': license_number,
+                        'Submit': 'Search'
+                    }
+                elif state == "AR":
+                    form_data = {
+                        'license_number': license_number,
+                        'search': 'Search'
+                    }
+                elif state == "MD":
+                    form_data = {
+                        'license_number': license_number,
+                        'action': 'search'
+                    }
+                else:
+                    # Generic form data
+                    form_data = {
+                        'license_number': license_number,
+                        'search': 'Search'
+                    }
+                
+                # Submit search request
+                async with session.post(config["url"], data=form_data, headers=headers) as response:
+                    html_content = await response.text()
+                
+                # Parse results
+                soup = BeautifulSoup(html_content, 'html.parser')
+                
+                # Determine status
+                status = "Unknown"
+                business_name_result = business_name or "Unknown"
+                expires = "Unknown"
+                
+                content_lower = html_content.lower()
+                if any(word in content_lower for word in ["active", "valid", "current", "good standing"]):
+                    status = "Active"
+                elif any(word in content_lower for word in ["expired", "inactive", "lapsed"]):
+                    status = "Expired"
+                elif any(word in content_lower for word in ["invalid", "not found", "no results", "no license"]):
+                    status = "Invalid"
+                elif any(word in content_lower for word in ["suspended", "revoked", "cancelled"]):
+                    status = "Suspended"
+                
+                return {
+                    "status": status,
+                    "license_number": license_number,
+                    "business_name": business_name_result,
+                    "issuing_authority": f"{state} {config.get('type', 'Licensing Board')}",
+                    "expires": expires,
+                    "verified": True,
+                    "verification_url": config["url"],
+                    "method_used": "requests",
+                    "format_valid": validate_license_format(state, license_number)["valid"]
+                }
+            
+        except Exception as e:
+            raise Exception(f"Error verifying {state} license with fallback method: {str(e)}")
+
+async def scrape_with_playwright(state: str, config: Dict, license_number: str, business_name: Optional[str] = None) -> Dict[str, Any]:
+    """Playwright scraping function"""
+    if not PLAYWRIGHT_AVAILABLE:
+        return await scrape_with_requests_fallback(state, config, license_number, business_name)
+    
+    async with async_playwright() as p:
+        try:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=['--no-sandbox', '--disable-blink-features=AutomationControlled', '--disable-dev-shm-usage']
+            )
+            
+            # Use different user agents and headers based on state requirements
+            user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            extra_headers = {}
+            
+            if state == "CA":
+                extra_headers['Referer'] = 'https://www.cslb.ca.gov/'
+            
+            context = await browser.new_context(
+                user_agent=user_agent,
+                extra_http_headers=extra_headers
+            )
+            page = await context.new_page()
+            
             await page.goto(config["url"], wait_until="networkidle", timeout=30000)
             
             # State-specific scraping logic
@@ -499,9 +616,8 @@ async def scrape_with_playwright(state: str, config: Dict, license_number: str, 
             # Take screenshot for evidence
             screenshot_bytes = await page.screenshot(full_page=True)
             
-            # Extract results - generic approach
+            # Extract results
             content = await page.content()
-            soup = BeautifulSoup(content, 'html.parser')
             
             # Determine license status
             status = "Unknown"
@@ -523,8 +639,7 @@ async def scrape_with_playwright(state: str, config: Dict, license_number: str, 
                 name_patterns = [
                     r"business name[:\s]+([^<\n\r]+)",
                     r"company name[:\s]+([^<\n\r]+)",
-                    r"contractor name[:\s]+([^<\n\r]+)",
-                    r"name[:\s]+([^<\n\r]+)"
+                    r"contractor name[:\s]+([^<\n\r]+)"
                 ]
                 for pattern in name_patterns:
                     match = re.search(pattern, content_lower)
@@ -555,22 +670,28 @@ async def scrape_with_playwright(state: str, config: Dict, license_number: str, 
                 "screenshot_data": base64.b64encode(screenshot_bytes).decode('utf-8'),
                 "verified": True,
                 "verification_url": config["url"],
+                "method_used": "playwright",
                 "format_valid": validate_license_format(state, license_number)["valid"]
             }
             
         except Exception as e:
             await browser.close()
-            raise Exception(f"Error scraping {state} license data: {str(e)}")
+            # Fallback to requests method if Playwright fails
+            print(f"Playwright failed for {state}, trying requests fallback: {str(e)}")
+            return await scrape_with_requests_fallback(state, config, license_number, business_name)
 
 async def scrape_with_requests(state: str, config: Dict, license_number: str, business_name: Optional[str] = None) -> Dict[str, Any]:
     """HTTP requests scraping for simpler sites"""
     async with aiohttp.ClientSession() as session:
         try:
             headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
                 'Accept-Language': 'en-US,en;q=0.5',
-                'Accept-Encoding': 'gzip, deflate'
+                'Accept-Encoding': 'gzip, deflate, br',
+                'DNT': '1',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1'
             }
             
             # Prepare form data based on state
@@ -579,26 +700,29 @@ async def scrape_with_requests(state: str, config: Dict, license_number: str, bu
                     'licnbr': license_number,
                     'Submit': 'Search'
                 }
+                # For Florida, try GET request first
+                search_url = f"{config['url']}?licnbr={license_number}"
+                async with session.get(search_url, headers=headers) as response:
+                    html_content = await response.text()
             elif state == "AR":
                 form_data = {
                     'license_number': license_number,
                     'search': 'Search'
                 }
+                async with session.post(config["url"], data=form_data, headers=headers) as response:
+                    html_content = await response.text()
             elif state == "MD":
                 form_data = {
                     'license_number': license_number,
                     'action': 'search'
                 }
+                async with session.post(config["url"], data=form_data, headers=headers) as response:
+                    html_content = await response.text()
             else:
-                # Generic form data
-                form_data = {
-                    'license_number': license_number,
-                    'search': 'Search'
-                }
-            
-            # Submit search request
-            async with session.post(config["url"], data=form_data, headers=headers) as response:
-                html_content = await response.text()
+                # Generic GET request with license number as parameter
+                search_url = f"{config['url']}?license={license_number}&search=1"
+                async with session.get(search_url, headers=headers) as response:
+                    html_content = await response.text()
             
             # Parse results
             soup = BeautifulSoup(html_content, 'html.parser')
@@ -609,12 +733,26 @@ async def scrape_with_requests(state: str, config: Dict, license_number: str, bu
             expires = "Unknown"
             
             content_lower = html_content.lower()
-            if any(word in content_lower for word in ["active", "valid", "current"]):
+            if any(word in content_lower for word in ["active", "valid", "current", "good standing"]):
                 status = "Active"
-            elif any(word in content_lower for word in ["expired", "inactive"]):
+            elif any(word in content_lower for word in ["expired", "inactive", "lapsed"]):
                 status = "Expired"
-            elif any(word in content_lower for word in ["invalid", "not found", "no results"]):
+            elif any(word in content_lower for word in ["invalid", "not found", "no results", "no license"]):
                 status = "Invalid"
+            elif any(word in content_lower for word in ["suspended", "revoked", "cancelled"]):
+                status = "Suspended"
+            
+            # Extract business name if found
+            name_patterns = [
+                r"business name[:\s]+([^<\n\r]+)",
+                r"company name[:\s]+([^<\n\r]+)",
+                r"contractor name[:\s]+([^<\n\r]+)"
+            ]
+            for pattern in name_patterns:
+                match = re.search(pattern, content_lower)
+                if match:
+                    business_name_result = match.group(1).strip()
+                    break
             
             return {
                 "status": status,
@@ -624,12 +762,13 @@ async def scrape_with_requests(state: str, config: Dict, license_number: str, bu
                 "expires": expires,
                 "verified": True,
                 "verification_url": config["url"],
+                "method_used": "requests",
                 "format_valid": validate_license_format(state, license_number)["valid"],
-                "raw_html_snippet": html_content[:500]  # First 500 chars for debugging
+                "note": "Limited data extraction due to website complexity"
             }
             
         except Exception as e:
-            raise Exception(f"Error verifying {state} license: {str(e)}")
+            raise Exception(f"Error verifying {state} license with requests: {str(e)}")
 
 async def verify_license(state: str, license_number: Optional[str] = None, business_name: Optional[str] = None) -> Dict[str, Any]:
     """Main license verification function"""
@@ -663,6 +802,7 @@ async def verify_license(state: str, license_number: Optional[str] = None, busin
     
     # Validate license format if provided
     if license_number:
+        license_number = normalize_license_number(state, license_number)
         format_validation = validate_license_format(state, license_number)
         if not format_validation["valid"] and "warning" not in format_validation:
             return {
@@ -674,8 +814,8 @@ async def verify_license(state: str, license_number: Optional[str] = None, busin
             }
     
     try:
-        # Choose scraping method
-        if config["method"] == "playwright":
+        # Choose scraping method - fallback to requests if Playwright not available
+        if config["method"] == "playwright" and PLAYWRIGHT_AVAILABLE:
             result = await scrape_with_playwright(state, config, license_number, business_name)
         else:
             result = await scrape_with_requests(state, config, license_number, business_name)
@@ -684,6 +824,7 @@ async def verify_license(state: str, license_number: Optional[str] = None, busin
         result["state"] = state
         result["license_type"] = config.get("type", "Unknown")
         result["notes"] = config.get("notes")
+        result["playwright_available"] = PLAYWRIGHT_AVAILABLE
         
         # Cache the result
         store_result(cache_key, result)
@@ -697,11 +838,9 @@ async def verify_license(state: str, license_number: Optional[str] = None, busin
             "license_number": license_number,
             "state": state,
             "verified": False,
-            "verification_url": config["url"]
+            "verification_url": config["url"],
+            "playwright_available": PLAYWRIGHT_AVAILABLE
         }
-        
-        # Cache error results for a shorter time to allow retries
-        store_result(f"error_{cache_key}", error_result)
         
         return error_result
 
@@ -724,7 +863,7 @@ async def verify_batch(requests: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             try:
                 # Add delay between requests to avoid overwhelming servers
                 if i > 0:
-                    await asyncio.sleep(2)  # 2 second delay between requests to same state
+                    await asyncio.sleep(3)  # 3 second delay between requests to same state
                 
                 result = await verify_license(
                     request.get("state"),
@@ -743,7 +882,7 @@ async def verify_batch(requests: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 }
         
         # Add longer delay between different states
-        await asyncio.sleep(1)
+        await asyncio.sleep(2)
     
     return results
 
@@ -754,7 +893,9 @@ def get_supported_states() -> Dict[str, Dict[str, Any]]:
             "type": config.get("type", "Unknown"),
             "format": config.get("format", "Unknown"),
             "example": config.get("example", "Unknown"),
-            "notes": config.get("notes")
+            "notes": config.get("notes"),
+            "method": config.get("method"),
+            "playwright_required": config.get("method") == "playwright"
         }
         for state, config in STATE_CONFIGS.items()
     }
@@ -765,7 +906,7 @@ def normalize_license_number(state: str, license_number: str) -> str:
     license_number = license_number.strip().upper()
     
     # State-specific normalization
-    if state == "CA" and not license_number.isdigit():
+    if state == "CA":
         # Remove any non-digit characters for CA
         license_number = re.sub(r'\D', '', license_number)
     elif state == "FL" and not license_number.startswith("CGC"):
@@ -780,6 +921,14 @@ def normalize_license_number(state: str, license_number: str) -> str:
         # Add WV prefix if missing
         if license_number.isdigit():
             license_number = f"WV{license_number}"
+    elif state == "CT" and not license_number.startswith("HIC."):
+        # Add HIC. prefix if missing
+        if license_number.isdigit():
+            license_number = f"HIC.{license_number}"
+    elif state == "SC" and not license_number.startswith("CLG"):
+        # Add CLG prefix if missing
+        if license_number.isdigit():
+            license_number = f"CLG{license_number}"
     
     return license_number
 
@@ -798,5 +947,17 @@ def get_state_info(state: str) -> Dict[str, Any]:
         "regex": config.get("regex"),
         "verification_url": config["url"],
         "method": config["method"],
-        "notes": config.get("notes")
+        "notes": config.get("notes"),
+        "playwright_available": PLAYWRIGHT_AVAILABLE,
+        "playwright_required": config.get("method") == "playwright"
+    }
+
+def get_system_status() -> Dict[str, Any]:
+    """Get system status and capabilities"""
+    return {
+        "playwright_available": PLAYWRIGHT_AVAILABLE,
+        "supported_states": len(STATE_CONFIGS),
+        "playwright_states": len([s for s, c in STATE_CONFIGS.items() if c.get("method") == "playwright"]),
+        "requests_states": len([s for s, c in STATE_CONFIGS.items() if c.get("method") == "requests"]),
+        "status": "operational" if PLAYWRIGHT_AVAILABLE else "limited_functionality"
     }
