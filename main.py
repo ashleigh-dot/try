@@ -1,3 +1,4 @@
+import os
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, validator
@@ -177,22 +178,29 @@ async def get_examples():
 async def get_stats():
     """Get API usage statistics"""
     from cache import get_cache_stats
-    cache_stats = get_cache_stats()
-    return {
-        "supported_states": len(STATE_CONFIGS),
-        "cached_results": cache_stats["cached_items"],
-        "cache_size_mb": cache_stats["cache_size_mb"],
-        "most_verified_states": ["CA", "FL", "TX", "NY", "PA"]
-    }
+    try:
+        cache_stats = get_cache_stats()
+        return {
+            "supported_states": len(STATE_CONFIGS),
+            "cached_results": cache_stats["cached_items"],
+            "cache_size_mb": cache_stats["cache_size_mb"],
+            "most_verified_states": ["CA", "FL", "TX", "NY", "PA"]
+        }
+    except Exception as e:
+        return {
+            "supported_states": len(STATE_CONFIGS),
+            "error": "Cache stats unavailable"
+        }
 
 # Error handlers
 @app.exception_handler(ValueError)
 async def value_error_handler(request, exc):
     return HTTPException(status_code=400, detail=str(exc))
 
-@app.exception_handler(404)
-async def not_found_handler(request, exc):
-    return {"error": "Resource not found", "detail": str(exc)}
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
     import uvicorn
