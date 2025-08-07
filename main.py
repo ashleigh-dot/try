@@ -1,26 +1,45 @@
 import os
+import logging
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, validator
 from typing import Optional, List, Dict, Any
-from scraper import (
-    verify_license, 
-    verify_batch, 
-    validate_license_format, 
-    get_supported_states, 
-    get_state_info,
-    normalize_license_number,
-    STATE_CONFIGS
-)
-import re
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Import our verification functions
+try:
+    from scraper import (
+        verify_license, 
+        verify_batch, 
+        validate_license_format, 
+        get_supported_states, 
+        get_state_info,
+        normalize_license_number,
+        STATE_CONFIGS,
+        get_system_status
+    )
+    logger.info("Successfully imported scraper functions")
+except ImportError as e:
+    logger.error(f"Failed to import scraper: {e}")
+    # Create minimal fallback
+    STATE_CONFIGS = {}
+    
+    async def verify_license(*args, **kwargs):
+        return {"status": "Error", "message": "Scraper module not available"}
+    
+    async def verify_batch(*args, **kwargs):
+        return [{"status": "Error", "message": "Scraper module not available"}]
 
 app = FastAPI(
     title="Contractor License Verification API", 
-    version="4.0",
-    description="Real-time contractor license verification across all US states"
+    version="4.0-simplified",
+    description="Real-time contractor license verification (Render-optimized version)"
 )
 
-# Add CORS middleware for web applications
+# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -39,66 +58,77 @@ class LicenseRequest(BaseModel):
         if not v or len(v) != 2:
             raise ValueError('State must be a 2-letter code (e.g., CA, FL, TX)')
         return v.upper()
-    
-    @validator('license_number')
-    def validate_license_number(cls, v, values):
-        if v:
-            # Remove extra whitespace
-            v = v.strip()
-            if 'state' in values:
-                # Normalize format for the state
-                v = normalize_license_number(values['state'], v)
-        return v
 
 class BatchRequest(BaseModel):
     requests: List[LicenseRequest]
     
     @validator('requests')
     def validate_batch_size(cls, v):
-        if len(v) > 50:  # Limit batch size to prevent overload
-            raise ValueError('Batch size cannot exceed 50 requests')
+        if len(v) > 20:  # Reduced batch size for free tier
+            raise ValueError('Batch size cannot exceed 20 requests on free tier')
         return v
-
-class FormatValidationRequest(BaseModel):
-    state: str
-    license_number: str
 
 @app.get("/")
 async def root():
-    return {
-        "message": "Contractor License Verification API v4.0",
-        "status": "active",
-        "supported_states": len(STATE_CONFIGS),
-        "features": [
-            "Real-time license verification",
-            "Format validation",
-            "Batch processing",
-            "Screenshot evidence",
-            "All 50 US states support"
-        ]
-    }
+    """API root endpoint with system information"""
+    try:
+        system_status = get_system_status()
+        return {
+            "message": "Contractor License Verification API v4.0",
+            "status": "active",
+            "supported_states": len(STATE_CONFIGS),
+            "system_info": system_status,
+            "endpoints": {
+                "verify": "POST /verify - Verify single license",
+                "verify_batch": "POST /verify_batch - Verify multiple licenses", 
+                "validate_format": "POST /validate_format - Validate license format",
+                "states": "GET /states - List supported states",
+                "search": "GET /search - Quick license search",
+                "examples": "GET /examples - Get example license numbers"
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error in root endpoint: {e}")
+        return {
+            "message": "Contractor License Verification API v4.0",
+            "status": "limited",
+            "error": "Some features may be unavailable"
+        }
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "timestamp": "2025-08-07"}
+    """Health check endpoint"""
+    return {
+        "status": "healthy", 
+        "timestamp": "2025-08-07",
+        "environment": "render" if os.environ.get("RENDER") else "local"
+    }
 
 @app.post("/verify")
 async def verify(request: LicenseRequest):
     """Verify a single contractor license"""
     try:
+        logger.info(f"Verifying license: {request.state} - {request.license_number}")
+        
         result = await verify_license(
             request.state, 
             request.license_number, 
             request.business_name
         )
+        
+        logger.info(f"Verification result: {result.get('status', 'Unknown')}")
         return result
+        
     except Exception as e:
+        logger.error(f"Verification error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/verify_batch")
 async def verify_multiple(batch: BatchRequest):
     """Verify multiple contractor licenses in batch"""
     try:
+        logger.info(f"Batch verification: {len(batch.requests)} requests")
+        
         queries = [r.dict() for r in batch.requests]
         results = await verify_batch(queries)
         
@@ -106,32 +136,37 @@ async def verify_multiple(batch: BatchRequest):
         summary = {
             "total_requests": len(results),
             "successful": len([r for r in results if r.get("verified", False)]),
-            "errors": len([r for r in results if r.get("status") == "Error"]),
-            "active_licenses": len([r for r in results if r.get("status") == "Active"]),
-            "expired_licenses": len([r for r in results if r.get("status") == "Expired"]),
-            "invalid_licenses": len([r for r in results if r.get("status") == "Invalid"])
+            "errors": len([r for r in results if r.get("status") == "Error"])
         }
+        
+        logger.info(f"Batch results: {summary}")
         
         return {
             "results": results,
             "summary": summary
         }
     except Exception as e:
+        logger.error(f"Batch verification error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/validate_format")
-async def validate_format(request: FormatValidationRequest):
+async def validate_format(request: LicenseRequest):
     """Validate license number format without performing verification"""
     try:
         result = validate_license_format(request.state, request.license_number)
         return result
     except Exception as e:
+        logger.error(f"Format validation error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/states")
 async def get_states():
     """Get list of supported states with their license requirements"""
-    return get_supported_states()
+    try:
+        return get_supported_states()
+    except Exception as e:
+        logger.error(f"Error getting states: {e}")
+        return {"error": "Unable to retrieve state information"}
 
 @app.get("/states/{state}")
 async def get_state_details(state: str):
@@ -142,6 +177,7 @@ async def get_state_details(state: str):
             raise HTTPException(status_code=404, detail=state_info["error"])
         return state_info
     except Exception as e:
+        logger.error(f"Error getting state details: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/search")
@@ -153,55 +189,58 @@ async def search_license(
 ):
     """Search/verify license via GET request (for easy testing)"""
     
-    if format_only and license_number:
-        return validate_license_format(state, license_number)
-    
     try:
+        if format_only and license_number:
+            return validate_license_format(state, license_number)
+        
         result = await verify_license(state, license_number, business_name)
         return result
     except Exception as e:
+        logger.error(f"Search error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/examples")
 async def get_examples():
     """Get example license numbers for each state"""
-    examples = {}
-    for state, config in STATE_CONFIGS.items():
-        examples[state] = {
-            "example": config.get("example", "Unknown"),
-            "format": config.get("format", "Unknown"),
-            "type": config.get("type", "Unknown")
-        }
-    return examples
-
-@app.get("/stats")
-async def get_stats():
-    """Get API usage statistics"""
-    from cache import get_cache_stats
     try:
-        cache_stats = get_cache_stats()
+        examples = {}
+        for state, config in STATE_CONFIGS.items():
+            examples[state] = {
+                "example": config.get("example", "Contact state for format"),
+                "format": config.get("format", "Varies"),
+                "type": config.get("type", "Professional License")
+            }
+        return examples
+    except Exception as e:
+        logger.error(f"Error getting examples: {e}")
+        return {"error": "Unable to retrieve examples"}
+
+@app.get("/debug")
+async def debug_info():
+    """Debug endpoint to check system status"""
+    try:
+        system_status = get_system_status()
         return {
-            "supported_states": len(STATE_CONFIGS),
-            "cached_results": cache_stats["cached_items"],
-            "cache_size_mb": cache_stats["cache_size_mb"],
-            "most_verified_states": ["CA", "FL", "TX", "NY", "PA"]
+            "system_status": system_status,
+            "environment_vars": {
+                "PORT": os.environ.get("PORT", "Not set"),
+                "PYTHON_VERSION": os.environ.get("PYTHON_VERSION", "Not set"),
+                "RENDER": os.environ.get("RENDER", "Not set"),
+                "PLAYWRIGHT_BROWSERS_PATH": os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "Not set")
+            },
+            "supported_states_count": len(STATE_CONFIGS)
         }
     except Exception as e:
-        return {
-            "supported_states": len(STATE_CONFIGS),
-            "error": "Cache stats unavailable"
-        }
+        return {"error": f"Debug info error: {e}"}
 
-# Error handlers
-@app.exception_handler(ValueError)
-async def value_error_handler(request, exc):
-    return HTTPException(status_code=400, detail=str(exc))
+# Global exception handler
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    logger.error(f"Global exception: {exc}")
+    return HTTPException(status_code=500, detail="Internal server error")
 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 10000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=10000)
+    logger.info(f"Starting server on port {port}")
+    uvicorn.run(app, host="0.0.0.0", port=port, workers=1)
