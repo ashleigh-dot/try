@@ -1,295 +1,461 @@
-import re
 import asyncio
-from typing import Optional, Dict, Any, List
-import aiohttp
-from bs4 import BeautifulSoup
-from cache import get_cached_result, store_result
-import logging
+import csv
+import os
+import random
+import re
 import base64
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Any, List, Optional
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+import aiohttp
+from lxml import html
 
+from cache import get_cached_result, store_result
+
+# ===== Paths & Globals =====
+BASE_DIR = Path(__file__).resolve().parent
+CSV_PATH = BASE_DIR / "contractor_license_verification_database.csv"
+SCREENSHOT_DIR = BASE_DIR / "screenshots"
+SCREENSHOT_DIR.mkdir(exist_ok=True)
+
+# State name to 2-letter code map (covers 50 states)
+STATE_NAME_TO_CODE = {
+    "Alabama":"AL","Alaska":"AK","Arizona":"AZ","Arkansas":"AR","California":"CA","Colorado":"CO","Connecticut":"CT",
+    "Delaware":"DE","Florida":"FL","Georgia":"GA","Hawaii":"HI","Idaho":"ID","Illinois":"IL","Indiana":"IN",
+    "Iowa":"IA","Kansas":"KS","Kentucky":"KY","Louisiana":"LA","Maine":"ME","Maryland":"MD","Massachusetts":"MA",
+    "Michigan":"MI","Minnesota":"MN","Mississippi":"MS","Missouri":"MO","Montana":"MT","Nebraska":"NE","Nevada":"NV",
+    "New Hampshire":"NH","New Jersey":"NJ","New Mexico":"NM","New York":"NY","North Carolina":"NC","North Dakota":"ND",
+    "Ohio":"OH","Oklahoma":"OK","Oregon":"OR","Pennsylvania":"PA","Rhode Island":"RI","South Carolina":"SC",
+    "South Dakota":"SD","Tennessee":"TN","Texas":"TX","Utah":"UT","Vermont":"VT","Virginia":"VA","Washington":"WA",
+    "West Virginia":"WV","Wisconsin":"WI","Wyoming":"WY"
+}
+
+# Loaded from CSV on import
+STATE_CONFIGS: Dict[str, Dict[str, Any]] = {}
+
+# User-Agents
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+]
+
+def _to_bool(val: str) -> bool:
+    if val is None:
+        return False
+    return str(val).strip().lower() in {"true","yes","1","y"}
+
+def load_state_configs() -> Dict[str, Dict[str, Any]]:
+    """Load CSV into STATE_CONFIGS keyed by 2-letter state code."""
+    configs: Dict[str, Dict[str, Any]] = {}
+    if not CSV_PATH.exists():
+        # Fallback: keep empty, API will show 0 supported
+        return configs
+
+    with open(CSV_PATH, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            state_raw = (row.get("STATE") or "").strip()
+            state_code = STATE_NAME_TO_CODE.get(state_raw, state_raw[:2].upper())
+            configs[state_code] = {
+                "STATE": state_code,
+                "AGENCY_NAME": (row.get("AGENCY_NAME") or "").strip(),
+                "LICENSE_TYPE": (row.get("LICENSE_TYPE") or "").strip(),
+                "VERIFICATION_URL": (row.get("VERIFICATION_URL") or "").strip(),
+                "LICENSE_REGEX": (row.get("LICENSE_REGEX") or "").strip(),
+                "EXAMPLE_LICENSE": (row.get("EXAMPLE_LICENSE") or "").strip(),
+                "FORM_METHOD": (row.get("FORM_METHOD") or "").strip().upper(),
+                "INPUT_FIELD_NAME": (row.get("INPUT_FIELD_NAME") or "").strip(),
+                "SEARCH_BUTTON_ID": (row.get("SEARCH_BUTTON_ID") or "").strip(),
+                "BUSINESS_NAME_XPATH": (row.get("BUSINESS_NAME_XPATH") or "").strip(),
+                "STATUS_XPATH": (row.get("STATUS_XPATH") or "").strip(),
+                "EXPIRES_XPATH": (row.get("EXPIRES_XPATH") or "").strip(),
+                "REQUIRES_JAVASCRIPT": _to_bool(row.get("REQUIRES_JAVASCRIPT") or "false"),
+                "ANTI_BOT_MEASURES": (row.get("ANTI_BOT_MEASURES") or "").strip(),
+                "SPECIAL_NOTES": (row.get("SPECIAL_NOTES") or "").strip(),
+            }
+    return configs
+
+# Load at import
+STATE_CONFIGS = load_state_configs()
+
+# Playwright optional import
 PLAYWRIGHT_AVAILABLE = False
 try:
     from playwright.async_api import async_playwright
     PLAYWRIGHT_AVAILABLE = True
-except ImportError:
-    logger.warning("Playwright not available")
+except Exception:
+    PLAYWRIGHT_AVAILABLE = False
 
-# All 50 states configuration
-STATE_CONFIGS = {
-    "AL": {"regex": r"^\d{5}$", "example": "55289", "type": "General Contractor", "format": "5 digits", "url": "https://genconbd.alabama.gov/DATABASE-SQL/roster.aspx", "method": "playwright"},
-    "AK": {"regex": r"^\d{6}$", "example": "110401", "type": "General Contractor", "format": "6 digits", "url": "https://www.commerce.alaska.gov/cbp/main/Search/Professional", "method": "playwright"},
-    "AZ": {"regex": r"^\d{6}$", "example": "321456", "type": "ROC License", "format": "6 digits", "url": "https://azroc.my.site.com/AZRoc/s/contractor-search", "method": "playwright"},
-    "AR": {"regex": r"^\d{8}$", "example": "2880113", "type": "Commercial Contractor", "format": "8 digits", "url": "http://aclb2.arkansas.gov/clbsearch.php", "method": "requests"},
-    "CA": {"regex": r"^\d{6,8}$", "example": "692447", "type": "CSLB Contractor", "format": "6-8 digits", "url": "https://www.cslb.ca.gov/onlineservices/checklicenseII/checklicense.aspx", "method": "playwright"},
-    "CO": {"regex": r"^\d{2}-\d{6}$", "example": "08-000039", "type": "Trade License", "format": "XX-XXXXXX", "url": "https://dpo.colorado.gov/", "method": "playwright"},
-    "CT": {"regex": r"^HIC\.\d{7}$", "example": "HIC.0654321", "type": "Home Improvement", "format": "HIC.XXXXXXX", "url": "https://www.elicense.ct.gov/lookup/licenselookup.aspx", "method": "playwright"},
-    "DE": {"regex": r"^\d{10}$", "example": "1990000000", "type": "Business License", "format": "10 digits", "url": "https://delpros.delaware.gov/OH_VerifyLicense", "method": "playwright"},
-    "FL": {"regex": r"^CGC\d{7}$", "example": "CGC1524312", "type": "General Contractor", "format": "CGC + 7 digits", "url": "https://www.myfloridalicense.com/wl11.asp", "method": "requests"},
-    "GA": {"url": "https://verify.sos.ga.gov/verification/Search.aspx", "method": "playwright", "type": "Professional License"},
-    "HI": {"regex": r"C-\d+", "example": "C-12345", "type": "Professional & Vocational", "format": "C-XXXXX", "url": "https://mypvl.dcca.hawaii.gov/public-license-search/", "method": "playwright"},
-    "ID": {"regex": r"[A-Z]-\d{5}", "example": "E-12345", "type": "Specialty contractor", "format": "X-XXXXX", "url": "https://dbs.idaho.gov/contractors/", "method": "playwright"},
-    "IL": {"regex": r"\d{7}", "example": "1234567", "type": "Professional", "format": "7 digits", "url": "https://ilesonline.idfpr.illinois.gov/DFPR/Lookup/LicenseLookup.aspx", "method": "playwright"},
-    "IN": {"regex": r"PC\d{6}", "example": "PC123456", "type": "Building & Trades", "format": "PC + 6 digits", "url": "https://mylicense.in.gov/everification/Search.aspx", "method": "playwright"},
-    "IA": {"regex": r"\d{5}", "example": "12345", "type": "Contractor registration", "format": "5 digits", "url": "https://laborportal.iwd.iowa.gov/iwd_portal/publicSearch/public", "method": "playwright"},
-    "KS": {"regex": r"T\d{6}", "example": "T123456", "type": "Technical Professions", "format": "T + 6 digits", "url": "https://ksbiz.kansas.gov/business-starter-kit/construction/", "method": "playwright"},
-    "KY": {"regex": r"HBC\d{6}", "example": "HBC123456", "type": "Building trades", "format": "HBC + 6 digits", "url": "https://ky.joportal.com/License/Search", "method": "playwright"},
-    "LA": {"regex": r"\d{6}", "example": "123456", "type": "General Contractor", "format": "6 digits", "url": "https://lslbc.louisiana.gov/contractor-search/", "method": "playwright"},
-    "ME": {"regex": r"\d{4,5}", "example": "1234", "type": "Electrical & Plumbing", "format": "4-5 digits", "url": "https://pfr.maine.gov/ALMSOnline/ALMSQuery/SearchIndividual.aspx", "method": "playwright"},
-    "MD": {"regex": r"\d{2}-\d{6}", "example": "01-123456", "type": "Home Improvement", "format": "XX-XXXXXX", "url": "https://www.dllr.state.md.us/cgi-bin/ElectronicLicensing/OP_search/OP_search.cgi?calling_app=HIC::HIC_qselect", "method": "requests"},
-    "MA": {"regex": r"CSL-\d{6}", "example": "CSL-123456", "type": "Construction Supervisor", "format": "CSL-XXXXXX", "url": "https://madpl.mylicense.com/Verification/", "method": "playwright"},
-    "MI": {"regex": r"\d{7}", "example": "1234567", "type": "Construction", "format": "7 digits", "url": "https://www.michigan.gov/lara/i-need-to/find-or-verify-a-licensed-professional-or-business", "method": "playwright"},
-    "MN": {"regex": r"\d{4,6}", "example": "123456", "type": "Contractor & trades", "format": "4-6 digits", "url": "https://secure.doli.state.mn.us/lookup/licensing.aspx", "method": "playwright"},
-    "MS": {"regex": r"\d{5}", "example": "12345", "type": "Contractor", "format": "5 digits", "url": "http://search.msboc.us/ConsolidatedResults.cfm?ContractorType=&VarDatasource=BOC&Advanced=1", "method": "requests"},
-    "MO": {"example": "20231234", "type": "Local Licensing", "format": "Varies", "url": "https://pr.mo.gov/licensee-search.asp", "method": "playwright"},
-    "MT": {"regex": r"\d{5}", "example": "12345", "type": "Construction", "format": "5 digits", "url": "https://erdcontractors.mt.gov/ICCROnlineSearch/registrationlookup.jsp", "method": "playwright"},
-    "NE": {"regex": r"\d{5}", "example": "12345", "type": "Contractor", "format": "5 digits", "url": "https://dol.nebraska.gov/conreg/Search", "method": "playwright"},
-    "NV": {"regex": r"\d{6}", "example": "123456", "type": "Contractors Board", "format": "6 digits", "url": "https://app.nvcontractorsboard.com/Clients/NVSCB/Public/ContractorLicenseSearch/ContractorLicenseSearch.aspx", "method": "playwright"},
-    "NH": {"regex": r"\d{6}", "example": "123456", "type": "Licensed trades", "format": "6 digits", "url": "https://oplc.nh.gov/license-lookup", "method": "playwright"},
-    "NJ": {"regex": r"\d{7}", "example": "1234567", "type": "Home Improvement", "format": "7 digits", "url": "https://newjersey.mylicense.com/verification/Search.aspx?facility=Y", "method": "playwright"},
-    "NM": {"regex": r"\d{6}", "example": "123456", "type": "Construction", "format": "6 digits", "url": "https://public.psiexams.com/search.jsp", "method": "playwright"},
-    "NY": {"example": "123456", "type": "Municipal Licensing", "format": "Varies", "url": "https://appext20.dos.ny.gov/lcns_public/licenseesearch/lcns_public_index.cfm", "method": "playwright"},
-    "NC": {"regex": r"\d{5}", "example": "12345", "type": "General Contractor", "format": "5 digits", "url": "https://portal.nclbgc.org/Public/Search", "method": "playwright"},
-    "ND": {"regex": r"\d{5}", "example": "12345", "type": "Contractor", "format": "5 digits", "url": "https://firststop.sos.nd.gov/search/contractor", "method": "playwright"},
-    "OH": {"regex": r"[A-Z]{2}\d{6}", "example": "HV123456", "type": "Commercial Trades", "format": "XX + 6 digits", "url": "https://elicense3.com.ohio.gov/", "method": "playwright"},
-    "OK": {"regex": r"\d{6}", "example": "123456", "type": "Construction Board", "format": "6 digits", "url": "https://okcibv7prod.glsuite.us/GLSuiteWeb/Clients/OKCIB/Public/LicenseeSearch/LicenseeSearch.aspx", "method": "playwright"},
-    "OR": {"regex": r"^\d{6}$", "example": "195480", "type": "Construction Contractors Board", "format": "6 digits", "url": "https://search.ccb.state.or.us/search/", "method": "playwright"},
-    "PA": {"regex": r"PA\d{6}", "example": "PA123456", "type": "Home Improvement", "format": "PA + 6 digits", "url": "https://hicsearch.attorneygeneral.gov/", "method": "playwright"},
-    "RI": {"example": "12345", "type": "Contractor Registration", "format": "5 digits", "url": "https://crb.ri.gov/consumer/search-registrantlicensee", "method": "playwright"},
-    "SC": {"regex": r"CLG\d{6}", "example": "CLG123456", "type": "Licensing Board", "format": "CLG + 6 digits", "url": "https://verify.llronline.com/LicLookup/Contractors/Contractor.aspx?div=69", "method": "playwright"},
-    "SD": {"regex": r"\d{5}", "example": "12345", "type": "Electrical/Plumbing", "format": "5 digits", "url": "https://sdec.portalus.thentiacloud.net/webs/portal/register/#/", "method": "playwright"},
-    "TN": {"regex": r"\d{6}", "example": "123456", "type": "Contractor", "format": "6 digits", "url": "https://www.tn.gov/commerce/regboards/contractor.html", "method": "playwright"},
-    "TX": {"regex": r"\d{5,6}", "example": "12345", "type": "TDLR License", "format": "5-6 digits", "url": "https://www.tdlr.texas.gov/LicenseSearch/", "method": "playwright"},
-    "UT": {"regex": r"\d{6}-\d{4}", "example": "123456-5501", "type": "Contractor", "format": "XXXXXX-XXXX", "url": "https://secure.utah.gov/llv/search/index.html", "method": "playwright"},
-    "VT": {"example": "456789", "type": "Registration", "format": "Varies", "url": "https://sos.vermont.gov/opr/find-a-professional/", "method": "playwright"},
-    "VA": {"regex": r"2705\d{6}", "example": "2710000000", "type": "Contractor", "format": "2705 + 6 digits", "url": "https://www.dpor.virginia.gov/LicenseLookup/", "method": "playwright"},
-    "WA": {"regex": r"[A-Z]{3}\d{4}", "example": "ABC1234", "type": "Registration", "format": "XXX + 4 digits", "url": "https://secure.lni.wa.gov/verify/", "method": "playwright"},
-    "WV": {"regex": r"WV\d{6}", "example": "WV012345", "type": "Licensing Board", "format": "WV + 6 digits", "url": "https://wvclboard.wv.gov/verify/", "method": "playwright"},
-    "WI": {"regex": r"\d{6}", "example": "123456", "type": "Dwelling Contractor", "format": "6 digits", "url": "https://dsps.wi.gov/Pages/Professions/Default.aspx", "method": "playwright"},
-    "WY": {"regex": r"\d{5}", "example": "12345", "type": "Local Licensing", "format": "5 digits", "url": "https://doe.state.wy.us/lmi/licensed_occupations.htm", "method": "playwright"}
-}
+def get_system_status() -> Dict[str, Any]:
+    return {
+        "status": "operational",
+        "playwright_available": PLAYWRIGHT_AVAILABLE,
+        "total_states": len(STATE_CONFIGS),
+        "last_loaded": datetime.utcnow().isoformat() + "Z"
+    }
 
-async def scrape_with_playwright(state: str, config: Dict, license_number: str) -> Dict[str, Any]:
-    """Playwright scraper for JavaScript sites"""
-    if not PLAYWRIGHT_AVAILABLE:
-        return await scrape_with_requests_fallback(state, config, license_number)
-    
-    async with async_playwright() as p:
-        browser = None
+def _headers() -> Dict[str, str]:
+    return {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Connection": "keep-alive"
+    }
+
+def _sleep_if_needed(config: Dict[str, Any]):
+    notes = (config.get("ANTI_BOT_MEASURES") or "").lower()
+    if "delay" in notes or "sleep" in notes:
+        # naive: if "delay 3s" appears, sleep 3; else random 1-3s
+        import re as _re, time as _time
+        m = _re.search(r"delay\s*(\d+)", notes)
+        sec = int(m.group(1)) if m else random.randint(1, 3)
+        _time.sleep(sec)
+
+def _text_or_none(val) -> Optional[str]:
+    if val is None:
+        return None
+    s = str(val).strip()
+    return s if s else None
+
+def normalize_license_number(state: str, license_number: str) -> str:
+    """Allow state-specific normalization; default is uppercase & strip spaces/dashes."""
+    if not license_number:
+        return license_number
+    num = license_number.strip().upper()
+    # light normalization: remove spaces unless clearly part of format like "HIC."
+    num = re.sub(r"\s+", "", num)
+    return num
+
+def _validate_format_with_regex(regex: str, license_number: str) -> bool:
+    if not regex:
+        return True
+    try:
+        return re.match(regex, license_number) is not None
+    except re.error:
+        # bad regex in CSV; allow through
+        return True
+
+def get_supported_states() -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    for code, cfg in STATE_CONFIGS.items():
+        out[code] = {
+            "type": cfg.get("LICENSE_TYPE") or "Professional License",
+            "format": cfg.get("LICENSE_REGEX") or "Varies",
+            "example": cfg.get("EXAMPLE_LICENSE") or "N/A"
+        }
+    return out
+
+def get_state_info(state: str) -> Dict[str, Any]:
+    code = state.upper()
+    cfg = STATE_CONFIGS.get(code)
+    if not cfg:
+        return {"error": f"State {state} not supported"}
+    return cfg
+
+async def _extract_with_xpath_from_text(html_text: str, cfg: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    """Extract name/status/expiry from raw HTML using XPaths from cfg."""
+    try:
+        tree = html.fromstring(html_text)
+    except Exception:
+        return {"business_name": None, "status": None, "expires": None}
+
+    def xp(xp_expr: str) -> Optional[str]:
+        if not xp_expr:
+            return None
         try:
-            browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
-            page = await browser.new_page()
-            await page.goto(config["url"], wait_until="networkidle", timeout=30000)
-            
-            # Find license input and search button intelligently
-            inputs = await page.query_selector_all("input[type='text'], input[name*='license'], input[id*='license']")
-            for input_elem in inputs:
-                try:
-                    await input_elem.fill(license_number)
-                    break
-                except:
-                    continue
-            
-            buttons = await page.query_selector_all("button, input[type='submit'], input[value*='Search']")
-            for button in buttons:
-                try:
-                    await button.click()
-                    break
-                except:
-                    continue
-            
-            await page.wait_for_load_state("networkidle", timeout=15000)
-            screenshot_bytes = await page.screenshot(full_page=True)
-            content = await page.content()
-            
-            # Extract data
-            extracted = extract_license_data(state, content)
-            await browser.close()
-            
-            return {
-                **extracted,
-                "license_number": license_number,
-                "verification_url": config["url"],
-                "screenshot_data": base64.b64encode(screenshot_bytes).decode('utf-8'),
-                "verified": True,
-                "state": state,
-                "license_type": config.get("type", "Unknown")
-            }
-            
-        except Exception as e:
-            if browser:
-                await browser.close()
-            return await scrape_with_requests_fallback(state, config, license_number)
+            nodes = tree.xpath(xp_expr)
+            if not nodes:
+                return None
+            node = nodes[0]
+            if isinstance(node, str):
+                return _text_or_none(node)
+            # lxml element
+            return _text_or_none(node.text_content())
+        except Exception:
+            return None
 
-async def scrape_with_requests_fallback(state: str, config: Dict, license_number: str) -> Dict[str, Any]:
-    """Fallback method using requests"""
-    async with aiohttp.ClientSession() as session:
+    return {
+        "business_name": xp(cfg.get("BUSINESS_NAME_XPATH", "")),
+        "status": xp(cfg.get("STATUS_XPATH", "")),
+        "expires": xp(cfg.get("EXPIRES_XPATH", "")),
+    }
+
+async def _scrape_with_requests(cfg: Dict[str, Any], license_number: str) -> Dict[str, Any]:
+    """For static pages without JS requirements. Supports GET or POST form submission."""
+    url = cfg.get("VERIFICATION_URL")
+    if not url:
+        return {"status": "Unsupported", "message": "No verification URL", "verified": False}
+
+    params = {}
+    data = {}
+    method = (cfg.get("FORM_METHOD") or "GET").upper()
+    field = cfg.get("INPUT_FIELD_NAME") or ""
+
+    # Some sites accept a direct querystring; otherwise use the provided field name
+    if method == "GET":
+        if field:
+            params[field] = license_number
+        else:
+            # fallback: try a generic param name
+            params["license"] = license_number
+    else:
+        if field:
+            data[field] = license_number
+        else:
+            data["license"] = license_number
+
+    async with aiohttp.ClientSession(headers=_headers()) as session:
+        # Optional initial GET to establish cookies
         try:
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-            
-            if state == "FL":
-                url = f"https://www.myfloridalicense.com/wl11.asp?mode=0&licnbr={license_number}"
-                async with session.get(url, headers=headers) as response:
-                    content = await response.text()
+            async with session.get(url, timeout=30) as _:
+                pass
+        except Exception:
+            # ignore warmup failures
+            pass
+
+        _sleep_if_needed(cfg)
+
+        try:
+            if method == "GET":
+                async with session.get(url, params=params, timeout=45) as resp:
+                    text = await resp.text()
             else:
-                params = {'license': license_number}
-                async with session.get(config["url"], params=params, headers=headers) as response:
-                    content = await response.text()
-            
-            extracted = extract_license_data(state, content)
-            
-            return {
-                **extracted,
-                "license_number": license_number,
-                "verification_url": config["url"],
-                "verified": extracted["status"] != "Unknown",
-                "method_used": "requests_fallback",
-                "state": state,
-                "license_type": config.get("type", "Unknown")
-            }
-            
+                async with session.post(url, data=data, timeout=45) as resp:
+                    text = await resp.text()
         except Exception as e:
-            raise Exception(f"Error verifying {state}: {str(e)}")
+            return {"status": "Error", "message": f"HTTP error: {e}", "verified": False}
 
-def extract_license_data(state: str, html_content: str) -> Dict[str, Any]:
-    """Extract license data from HTML content"""
-    content_lower = html_content.lower()
-    
-    # Extract business name
-    name_patterns = [
-        r'<h[1-6][^>]*>([^<]*(?:LLC|INC|CORP|COMPANY)[^<]*)</h[1-6]>',
-        r'business name[:\s]*([^<\n\r]+)',
-        r'company[:\s]*([^<\n\r]+)',
-        r'contractor[:\s]*([A-Z][^<\n\r,]{5,})'
-    ]
-    business_name = "Unknown"
-    for pattern in name_patterns:
-        match = re.search(pattern, html_content, re.IGNORECASE)
-        if match:
-            name = match.group(1).strip()
-            if len(name) > 3 and not name.isdigit():
-                business_name = name
-                break
-    
-    # Extract status
-    status = "Unknown"
-    if any(word in content_lower for word in ["active", "valid", "current", "good standing"]):
-        status = "Active"
-    elif any(word in content_lower for word in ["expired", "inactive", "lapsed"]):
-        status = "Expired"
-    elif any(word in content_lower for word in ["invalid", "not found", "no results"]):
-        status = "Invalid"
-    elif any(word in content_lower for word in ["suspended", "revoked"]):
-        status = "Suspended"
-    
-    # Extract expiration
-    expires = "Unknown"
-    date_patterns = [r'expir[a-z]*[:\s]*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})', r'expires[:\s]*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})']
-    for pattern in date_patterns:
-        match = re.search(pattern, html_content, re.IGNORECASE)
-        if match:
-            expires = match.group(1)
-            break
-    
-    return {"status": status, "business_name": business_name, "expires": expires}
+    extracted = await _extract_with_xpath_from_text(text, cfg)
+
+    status = extracted.get("status") or "Unknown"
+    business_name = extracted.get("business_name") or "Unknown"
+    expires = extracted.get("expires") or None
+
+    # Consider verified True if we found a business name or a non-Unknown status
+    verified = bool(business_name and business_name != "Unknown") or (status and status != "Unknown")
+
+    return {
+        "state": cfg.get("STATE"),
+        "license_number": license_number,
+        "license_type": cfg.get("LICENSE_TYPE") or "Professional License",
+        "verification_url": url,
+        "business_name": business_name,
+        "status": status,
+        "expires": expires,
+        "verified": verified,
+        "method_used": "requests"
+    }
+
+async def _scrape_with_playwright(cfg: Dict[str, Any], license_number: str) -> Dict[str, Any]:
+    """Use Playwright for JS-required sites. Fill field by name if provided, else heuristic."""
+    if not PLAYWRIGHT_AVAILABLE:
+        # fallback to requests if playwright missing
+        return await _scrape_with_requests(cfg, license_number)
+
+    from playwright.async_api import async_playwright
+
+    url = cfg.get("VERIFICATION_URL")
+    screenshot_file = SCREENSHOT_DIR / f"{cfg.get('STATE')}_{license_number}_{int(datetime.utcnow().timestamp())}.png"
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage"])
+        context = await browser.new_context(user_agent=random.choice(USER_AGENTS))
+        page = await context.new_page()
+
+        try:
+            await page.goto(url, wait_until="networkidle", timeout=60000)
+        except Exception as e:
+            await browser.close()
+            return {"status": "Error", "message": f"Failed to open page: {e}", "verified": False}
+
+        # Delay if requested by anti-bot notes
+        notes = (cfg.get("ANTI_BOT_MEASURES") or "").lower()
+        if "delay" in notes or "sleep" in notes:
+            m = re.search(r"delay\s*(\d+)", notes)
+            ms = (int(m.group(1)) if m else random.randint(1,3)) * 1000
+            await page.wait_for_timeout(ms)
+
+        # Fill input and submit
+        field_name = cfg.get("INPUT_FIELD_NAME")
+        search_btn_id = cfg.get("SEARCH_BUTTON_ID")
+
+        filled = False
+        if field_name:
+            try:
+                await page.fill(f"input[name=\"{field_name}\"]", license_number)
+                filled = True
+            except Exception:
+                filled = False
+
+        if not filled:
+            # Heuristic: try common input names
+            candidates = [
+                "input[name*=license i]",
+                "input[id*=license i]",
+                "input[name*=lic i]",
+                "input[type='text']"
+            ]
+            for sel in candidates:
+                try:
+                    locator = page.locator(sel).first
+                    if await locator.count() > 0:
+                        await locator.fill(license_number)
+                        filled = True
+                        break
+                except Exception:
+                    continue
+
+        # Click submit
+        clicked = False
+        if search_btn_id:
+            try:
+                await page.click(f"#{search_btn_id}")
+                clicked = True
+            except Exception:
+                clicked = False
+
+        if not clicked:
+            # Heuristic buttons
+            btn_selectors = [
+                "button:has-text('Search')",
+                "input[type='submit']",
+                "button[type='submit']",
+                "button:has-text('Go')"
+            ]
+            for sel in btn_selectors:
+                try:
+                    if await page.locator(sel).count() > 0:
+                        await page.click(sel)
+                        clicked = True
+                        break
+                except Exception:
+                    continue
+
+        # Wait for results
+        try:
+            await page.wait_for_load_state("networkidle", timeout=20000)
+        except Exception:
+            # continue anyway
+            pass
+
+        # Screenshot evidence
+        try:
+            await page.screenshot(path=str(screenshot_file), full_page=True)
+            with open(screenshot_file, "rb") as f:
+                screenshot_b64 = base64.b64encode(f.read()).decode("utf-8")
+        except Exception:
+            screenshot_b64 = None
+
+        # Extract via XPath using page.locator with xpath=
+        async def get_by_xpath(xp: str) -> Optional[str]:
+            if not xp:
+                return None
+            try:
+                loc = page.locator(f"xpath={xp}")
+                if await loc.count() == 0:
+                    return None
+                # take first
+                text = await loc.first.inner_text()
+                text = text.strip()
+                return text if text else None
+            except Exception:
+                return None
+
+        business_name = await get_by_xpath(cfg.get("BUSINESS_NAME_XPATH",""))
+        status = await get_by_xpath(cfg.get("STATUS_XPATH",""))
+        expires = await get_by_xpath(cfg.get("EXPIRES_XPATH",""))
+
+        await browser.close()
+
+        verified = bool(business_name) or bool(status)
+
+        return {
+            "state": cfg.get("STATE"),
+            "license_number": license_number,
+            "license_type": cfg.get("LICENSE_TYPE") or "Professional License",
+            "verification_url": url,
+            "business_name": business_name or "Unknown",
+            "status": status or "Unknown",
+            "expires": expires or None,
+            "verified": verified,
+            "screenshot_data": screenshot_b64,
+            "screenshot_path": str(screenshot_file),
+            "method_used": "playwright"
+        }
 
 async def verify_license(state: str, license_number: Optional[str] = None, business_name: Optional[str] = None) -> Dict[str, Any]:
-    """Main verification function"""
+    """Main verification entrypoint used by FastAPI. Returns accurate fields using CSV config."""
     if not state or not license_number:
-        raise Exception("State and license number required")
-    
-    state = state.upper()
-    license_number = normalize_license_number(state, license_number)
-    
-    cache_key = f"{state}_{license_number}"
+        raise ValueError("State and license_number are required")
+
+    state_code = state.upper()
+    cfg = STATE_CONFIGS.get(state_code)
+    if not cfg:
+        return {"status": "Unsupported", "message": f"State {state_code} not supported", "verified": False}
+
+    # Normalize & validate
+    norm_license = normalize_license_number(state_code, license_number)
+
+    regex = cfg.get("LICENSE_REGEX") or ""
+    if regex and not _validate_format_with_regex(regex, norm_license):
+        return {
+            "status": "Invalid Format",
+            "message": f"License number does not match expected format for {state_code}",
+            "expected_format": regex,
+            "example": cfg.get("EXAMPLE_LICENSE") or "N/A",
+            "verified": False
+        }
+
+    # Cache lookup
+    cache_key = f"{state_code}:{norm_license}"
     try:
         cached = get_cached_result(cache_key)
         if cached:
             cached["from_cache"] = True
             return cached
-    except:
+    except Exception:
         pass
-    
-    if state not in STATE_CONFIGS:
-        return {"status": "Unsupported", "message": f"State {state} not supported", "supported_states": list(STATE_CONFIGS.keys()), "verified": False}
-    
-    config = STATE_CONFIGS[state]
-    
-    # Validate format
-    if config.get("regex") and not re.match(config["regex"], license_number):
-        return {"status": "Invalid Format", "message": f"Invalid format for {state}", "example": config.get("example"), "verified": False}
-    
-    try:
-        if config["method"] == "playwright":
-            result = await scrape_with_playwright(state, config, license_number)
-        else:
-            result = await scrape_with_requests_fallback(state, config, license_number)
-        
-        try:
-            store_result(cache_key, result)
-        except:
-            pass
-        
-        return result
-        
-    except Exception as e:
-        return {"status": "Error", "message": str(e), "license_number": license_number, "state": state, "verified": False}
 
-def normalize_license_number(state: str, license_number: str) -> str:
-    """Normalize license numbers with state prefixes"""
-    state = state.upper()
-    license_number = license_number.strip().upper()
-    
-    prefixes = {
-        "FL": lambda x: f"CGC{x}" if x.isdigit() and not x.startswith("CGC") else x,
-        "PA": lambda x: f"PA{x}" if x.isdigit() and not x.startswith("PA") else x,
-        "WV": lambda x: f"WV{x}" if x.isdigit() and not x.startswith("WV") else x,
-        "CT": lambda x: f"HIC.{x}" if x.isdigit() and not x.startswith("HIC.") else x,
-        "SC": lambda x: f"CLG{x}" if x.isdigit() and not x.startswith("CLG") else x,
-        "CA": lambda x: re.sub(r'\D', '', x)
-    }
-    
-    return prefixes.get(state, lambda x: x)(license_number)
+    # Choose path
+    requires_js = bool(cfg.get("REQUIRES_JAVASCRIPT"))
+    if requires_js:
+        result = await _scrape_with_playwright(cfg, norm_license)
+    else:
+        result = await _scrape_with_requests(cfg, norm_license)
+
+    # Persist to cache
+    try:
+        store_result(cache_key, result)
+    except Exception:
+        pass
+
+    return result
 
 async def verify_batch(requests: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Batch verification with delays"""
-    results = []
-    for i, request in enumerate(requests):
+    """Batch verification with gentle throttling to avoid anti-bot triggers."""
+    results: List[Dict[str, Any]] = []
+    for i, req in enumerate(requests):
         if i > 0:
+            # small delay between requests; could be tuned or made state-specific
             await asyncio.sleep(2)
         try:
-            result = await verify_license(request.get("state"), request.get("license_number"))
-            results.append(result)
+            res = await verify_license(req.get("state"), req.get("license_number"), req.get("business_name"))
+            results.append(res)
         except Exception as e:
             results.append({"status": "Error", "message": str(e), "verified": False})
     return results
 
 def validate_license_format(state: str, license_number: str) -> Dict[str, Any]:
-    """Validate format"""
-    state = state.upper()
-    if state not in STATE_CONFIGS:
-        return {"valid": False, "error": f"State {state} not supported"}
-    
-    config = STATE_CONFIGS[state]
-    regex = config.get("regex")
-    if not regex:
-        return {"valid": True, "warning": "No format validation"}
-    
-    return {"valid": bool(re.match(regex, license_number)), "expected_format": config["format"], "example": config["example"]}
-
-def get_supported_states() -> Dict[str, Dict[str, Any]]:
-    """Get supported states"""
-    return {state: {"type": config.get("type"), "format": config.get("format"), "example": config.get("example")} for state, config in STATE_CONFIGS.items()}
-
-def get_state_info(state: str) -> Dict[str, Any]:
-    """Get state info"""
-    state = state.upper()
-    if state not in STATE_CONFIGS:
-        return {"error": f"State {state} not supported"}
-    return STATE_CONFIGS[state]
-
-def get_system_status() -> Dict[str, Any]:
-    """System status"""
-    return {"status": "operational", "playwright_available": PLAYWRIGHT_AVAILABLE, "total_states": len(STATE_CONFIGS), "version": "4.3-complete"}
+    code = state.upper()
+    cfg = STATE_CONFIGS.get(code)
+    if not cfg:
+        return {"valid": False, "error": f"State {code} not supported"}
+    regex = cfg.get("LICENSE_REGEX") or ""
+    ok = _validate_format_with_regex(regex, license_number) if regex else True
+    return {
+        "valid": ok,
+        "expected_format": regex or "Varies",
+        "example": cfg.get("EXAMPLE_LICENSE") or "N/A"
+    }
