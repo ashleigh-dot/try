@@ -2,22 +2,11 @@ services:
   - type: web
     name: contractor-verifier
     runtime: python
+    plan: free
     buildCommand: |
       pip install --upgrade pip
       pip install -r requirements.txt
-      python -c "import sys; print('Python version:', sys.version)"
-      python -c "
-      try:
-          import playwright
-          print('Installing Playwright browsers...')
-          import subprocess
-          subprocess.run(['playwright', 'install', 'chromium'], check=True)
-          subprocess.run(['playwright', 'install-deps'], check=True)
-          print('Playwright installation complete')
-      except Exception as e:
-          print('Playwright installation failed:', e)
-          print('Service will run with requests-only mode')
-      "
+      python -m playwright install --with-deps chromium
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
     envVars:
       - key: PYTHON_VERSION
@@ -26,4 +15,3 @@ services:
         value: /opt/render/.cache/ms-playwright
       - key: PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD
         value: "0"
-    plan: free
