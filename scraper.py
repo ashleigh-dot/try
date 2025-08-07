@@ -1,148 +1,156 @@
 import asyncio
 import csv
-import os
 import random
-import time
+import re
+import base64
+from datetime import datetime
 from pathlib import Path
+from typing import Dict, Any, List, Optional
 
-import requests
+import aiohttp
 from lxml import html
-from playwright.async_api import async_playwright
 
-CACHE_DIR = Path("cache")
-SCREENSHOT_DIR = Path("screenshots")
-CACHE_DIR.mkdir(exist_ok=True)
+from cache import get_cached_result, store_result
+
+# ===== Paths & Globals =====
+BASE_DIR = Path(__file__).resolve().parent
+CSV_PATH = BASE_DIR / "contractor_license_verification_database.csv"
+SCREENSHOT_DIR = BASE_DIR / "screenshots"
 SCREENSHOT_DIR.mkdir(exist_ok=True)
 
-CSV_FILE = "contractor_license_verification_database.csv"
-STATE_CONFIGS = {}
+# State name to 2-letter code map (covers 50 states)
+STATE_NAME_TO_CODE = {
+    "Alabama":"AL","Alaska":"AK","Arizona":"AZ","Arkansas":"AR","California":"CA","Colorado":"CO","Connecticut":"CT",
+    "Delaware":"DE","Florida":"FL","Georgia":"GA","Hawaii":"HI","Idaho":"ID","Illinois":"IL","Indiana":"IN",
+    "Iowa":"IA","Kansas":"KS","Kentucky":"KY","Louisiana":"LA","Maine":"ME","Maryland":"MD","Massachusetts":"MA",
+    "Michigan":"MI","Minnesota":"MN","Mississippi":"MS","Missouri":"MO","Montana":"MT","Nebraska":"NE","Nevada":"NV",
+    "New Hampshire":"NH","New Jersey":"NJ","New Mexico":"NM","New York":"NY","North Carolina":"NC","North Dakota":"ND",
+    "Ohio":"OH","Oklahoma":"OK","Oregon":"OR","Pennsylvania":"PA","Rhode Island":"RI","South Carolina":"SC",
+    "South Dakota":"SD","Tennessee":"TN","Texas":"TX","Utah":"UT","Vermont":"VT","Virginia":"VA","Washington":"WA",
+    "West Virginia":"WV","Wisconsin":"WI","Wyoming":"WY"
+}
 
-# Load CSV into STATE_CONFIGS dict
-with open(CSV_FILE, newline='', encoding='utf-8') as f:
-    reader = csv.DictReader(f)
-    for row in reader:
-        STATE_CONFIGS[row["STATE"].strip().lower()] = row
+# ===== CSV -> STATE_CONFIGS =====
+def _to_bool(val: str) -> bool:
+    if val is None:
+        return False
+    return str(val).strip().lower() in {"true","yes","1","y"}
 
+def load_state_configs() -> Dict[str, Dict[str, Any]]:
+    configs: Dict[str, Dict[str, Any]] = {}
+    if not CSV_PATH.exists():
+        return configs
+    with open(CSV_PATH, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            state_raw = (row.get("STATE") or "").strip()
+            # Accept either full state name or 2-letter code in CSV
+            state_code = STATE_NAME_TO_CODE.get(state_raw, state_raw[:2].upper())
+            configs[state_code] = {
+                "STATE": state_code,
+                "AGENCY_NAME": (row.get("AGENCY_NAME") or "").strip(),
+                "LICENSE_TYPE": (row.get("LICENSE_TYPE") or "").strip(),
+                "VERIFICATION_URL": (row.get("VERIFICATION_URL") or "").strip(),
+                "LICENSE_REGEX": (row.get("LICENSE_REGEX") or "").strip(),
+                "EXAMPLE_LICENSE": (row.get("EXAMPLE_LICENSE") or "").strip(),
+                "FORM_METHOD": (row.get("FORM_METHOD") or "GET").strip().upper(),
+                "INPUT_FIELD_NAME": (row.get("INPUT_FIELD_NAME") or "").strip(),
+                "SEARCH_BUTTON_ID": (row.get("SEARCH_BUTTON_ID") or "").strip(),
+                "BUSINESS_NAME_XPATH": (row.get("BUSINESS_NAME_XPATH") or "").strip(),
+                "STATUS_XPATH": (row.get("STATUS_XPATH") or "").strip(),
+                "EXPIRES_XPATH": (row.get("EXPIRES_XPATH") or "").strip(),
+                "REQUIRES_JAVASCRIPT": _to_bool(row.get("REQUIRES_JAVASCRIPT") or "false"),
+                "ANTI_BOT_MEASURES": (row.get("ANTI_BOT_MEASURES") or "").strip(),
+                "SPECIAL_NOTES": (row.get("SPECIAL_NOTES") or "").strip(),
+            }
+    return configs
 
-def cache_get(key: str):
-    cache_file = CACHE_DIR / f"{key}.txt"
-    if cache_file.exists():
-        return cache_file.read_text(encoding="utf-8")
-    return None
+STATE_CONFIGS: Dict[str, Dict[str, Any]] = load_state_configs()
 
+# ===== Optional Playwright =====
+PLAYWRIGHT_AVAILABLE = False
+try:
+    from playwright.async_api import async_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except Exception:
+    PLAYWRIGHT_AVAILABLE = False
 
-def cache_set(key: str, value: str):
-    cache_file = CACHE_DIR / f"{key}.txt"
-    cache_file.write_text(value, encoding="utf-8")
-
-
-async def fetch_with_playwright(config, license_number):
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page(user_agent=random_user_agent())
-
-        await page.goto(config["VERIFICATION_URL"], timeout=60000)
-
-        # Fill form
-        if config["INPUT_FIELD_NAME"] != "N/A":
-            await page.fill(f'[name="{config["INPUT_FIELD_NAME"]}"]', license_number)
-        if config["SEARCH_BUTTON_ID"] != "N/A":
-            await page.click(f'#{config["SEARCH_BUTTON_ID"]}')
-
-        await page.wait_for_timeout(3000)  # Let page load results
-
-        # Extract data via XPath
-        content = await page.content()
-        tree = html.fromstring(content)
-
-        business_name = extract_xpath(tree, config["BUSINESS_NAME_XPATH"])
-        status = extract_xpath(tree, config["STATUS_XPATH"])
-        expires = extract_xpath(tree, config["EXPIRES_XPATH"])
-
-        # Screenshot
-        screenshot_path = SCREENSHOT_DIR / f"{config['STATE']}_{license_number}.png"
-        await page.screenshot(path=str(screenshot_path))
-
-        await browser.close()
-
-        return {
-            "business_name": business_name,
-            "status": status,
-            "expiration": expires,
-            "screenshot": str(screenshot_path)
-        }
-
-
-def fetch_with_requests(config, license_number):
-    headers = {
-        "User-Agent": random_user_agent(),
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    session = requests.Session()
-    session.headers.update(headers)
-
-    if config["FORM_METHOD"].upper() == "GET":
-        resp = session.get(config["VERIFICATION_URL"], params={config["INPUT_FIELD_NAME"]: license_number}, timeout=30)
-    else:
-        resp = session.post(config["VERIFICATION_URL"], data={config["INPUT_FIELD_NAME"]: license_number}, timeout=30)
-
-    tree = html.fromstring(resp.text)
-
-    business_name = extract_xpath(tree, config["BUSINESS_NAME_XPATH"])
-    status = extract_xpath(tree, config["STATUS_XPATH"])
-    expires = extract_xpath(tree, config["EXPIRES_XPATH"])
-
-    screenshot_path = SCREENSHOT_DIR / f"{config['STATE']}_{license_number}.png"
-    screenshot_path.write_text("Requests mode: No visual screenshot available", encoding="utf-8")
-
+# ===== Utilities expected by main.py =====
+def get_system_status() -> Dict[str, Any]:
     return {
-        "business_name": business_name,
-        "status": status,
-        "expiration": expires,
-        "screenshot": str(screenshot_path)
+        "status": "operational",
+        "playwright_available": PLAYWRIGHT_AVAILABLE,
+        "total_states": len(STATE_CONFIGS),
+        "last_loaded": datetime.utcnow().isoformat() + "Z"
     }
 
+def normalize_license_number(state: str, license_number: str) -> str:
+    if not license_number:
+        return license_number
+    num = license_number.strip().upper()
+    # keep dots/dashes if part of format; but remove spaces
+    num = re.sub(r"\s+", "", num)
+    return num
 
-def extract_xpath(tree, xpath_expr):
-    try:
-        el = tree.xpath(xpath_expr)
-        if not el:
-            return None
-        if isinstance(el, list):
-            el = el[0]
-        return el.strip() if hasattr(el, 'strip') else str(el)
-    except Exception:
+def get_supported_states() -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    for code, cfg in STATE_CONFIGS.items():
+        out[code] = {
+            "type": cfg.get("LICENSE_TYPE") or "Professional License",
+            "format": cfg.get("LICENSE_REGEX") or "Varies",
+            "example": cfg.get("EXAMPLE_LICENSE") or "N/A"
+        }
+    return out
+
+def get_state_info(state: str) -> Dict[str, Any]:
+    code = state.upper()
+    cfg = STATE_CONFIGS.get(code)
+    if not cfg:
+        return {"error": f"State {state} not supported"}
+    return cfg
+
+# ===== HTTP helpers =====
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+]
+def _headers() -> Dict[str, str]:
+    return {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Connection": "keep-alive"
+    }
+
+def _sleep_if_needed(config: Dict[str, Any]):
+    notes = (config.get("ANTI_BOT_MEASURES") or "").lower()
+    if "delay" in notes or "sleep" in notes:
+        m = re.search(r"delay\s*(\d+)", notes)
+        import time as _t
+        sec = int(m.group(1)) if m else random.randint(1, 3)
+        _t.sleep(sec)
+
+def _text_or_none(val) -> Optional[str]:
+    if val is None:
         return None
+    s = str(val).strip()
+    return s if s else None
 
+def _validate_format_with_regex(regex: str, license_number: str) -> bool:
+    if not regex:
+        return True
+    try:
+        return re.match(regex, license_number) is not None
+    except re.error:
+        # bad regex in CSV; don't block user
+        return True
 
-def random_user_agent():
-    uas = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17 Safari/605.1.15",
-        "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/117.0",
-    ]
-    return random.choice(uas)
+async def _extract_with_xpath_from_text(html_text: str, cfg: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    try:
+        tree = html.fromstring(html_text)
+    except Exception:
+        return {"business_name": None, "status": None, "expires": None}
 
-
-async def verify_license(state: str, license_number: str):
-    state_key = state.lower().strip()
-    if state_key not in STATE_CONFIGS:
-        return {"error": f"State '{state}' not found in database"}
-
-    config = STATE_CONFIGS[state_key]
-
-    cache_key = f"{state_key}_{license_number}"
-    cached = cache_get(cache_key)
-    if cached:
-        return eval(cached)  # safe enough here, since we wrote it
-
-    # Random delay to mimic human
-    time.sleep(random.uniform(1.0, 3.0))
-
-    if config["REQUIRES_JAVASCRIPT"].strip().lower() == "true":
-        result = await fetch_with_playwright(config, license_number)
-    else:
-        result = fetch_with_requests(config, license_number)
-
-    cache_set(cache_key, str(result))
-    return result
+    def xp(xp_expr: str) -> Optional[str]:
+       
