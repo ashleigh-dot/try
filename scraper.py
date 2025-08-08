@@ -93,11 +93,11 @@ OVERRIDES: Dict[str, Dict[str, Any]] = {
     # Oregon CCB — result list then detail page
     "OR": {
         "REQUIRES_JAVASCRIPT": True,
+        # Try both the header-following bold and the table-based path
         "BUSINESS_NAME_XPATH": "(//h1[contains(.,'CCB License Summary')]/following::*[self::b or self::strong or self::span])[1] || //td[normalize-space()='License #:']/preceding::b[1]",
         "STATUS_XPATH": "//td[normalize-space()='Status:']/following-sibling::td[1]",
         "EXPIRES_XPATH": "//td[normalize-space()='Expires:']/following-sibling::td[1]",
     },
-    # Add more state overrides here as needed (MA, NJ, NV, PA, …)
 }
 
 def _apply_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -278,9 +278,9 @@ async def _navigate_to_detail_if_needed(page, cfg: Dict[str, Any], license_numbe
       - link/text that exactly matches the license number
       - buttons/links labeled 'Details', 'More', 'View'
       - the first link inside a results table/grid
-    Safe to call multiple times; it no-ops if already on detail page.
     """
     try:
+        # already on a detail page?
         detail_markers = [
             "License Summary", "License Details", "Detail", "Licensee Details",
             "CCB License Summary", "License Information", "License Number:"
@@ -324,6 +324,69 @@ async def _navigate_to_detail_if_needed(page, cfg: Dict[str, Any], license_numbe
         except Exception:
             continue
 
+async def _fill_and_search(page, cfg: Dict[str, Any], license_number: str):
+    """Fill search form with best-effort heuristics + known state quirks."""
+    field_name = cfg.get("INPUT_FIELD_NAME") or ""
+    search_btn_id = cfg.get("SEARCH_BUTTON_ID") or ""
+
+    # OR-specific hints (handle common selectors seen on CCB search)
+    state = (cfg.get("STATE") or "").upper()
+    or_candidates = [
+        "#LicNum", "input[name='LicNum']",
+        "input[name='searchString']", "#searchString"
+    ] if state == "OR" else []
+
+    filled = False
+
+    # CSV-provided name
+    if field_name:
+        try:
+            await page.fill(f"input[name=\"{field_name}\"]", license_number)
+            filled = True
+        except Exception:
+            filled = False
+
+    # State-specific fallbacks
+    if not filled and or_candidates:
+        for sel in or_candidates:
+            try:
+                if await page.locator(sel).count() > 0:
+                    await page.fill(sel, license_number)
+                    filled = True
+                    break
+            except Exception:
+                continue
+
+    # Heuristics
+    if not filled:
+        for sel in ["input[name*=license i]", "input[id*=license i]", "input[name*=lic i]", "input[type='text']"]:
+            try:
+                loc = page.locator(sel).first
+                if await loc.count() > 0:
+                    await loc.fill(license_number)
+                    filled = True
+                    break
+            except Exception:
+                continue
+
+    # Click search button
+    clicked = False
+    if search_btn_id:
+        try:
+            await page.click(f"#{search_btn_id}")
+            clicked = True
+        except Exception:
+            clicked = False
+    if not clicked:
+        for sel in ["button:has-text('Search')", "input[type='submit']", "button[type='submit']", "button:has-text('Go')"]:
+            try:
+                if await page.locator(sel).count() > 0:
+                    await page.click(sel)
+                    clicked = True
+                    break
+            except Exception:
+                continue
+
 async def _scrape_with_playwright(cfg: Dict[str, Any], license_number: str) -> Dict[str, Any]:
     if not PLAYWRIGHT_AVAILABLE:
         return await _scrape_with_requests(cfg, license_number)
@@ -351,52 +414,14 @@ async def _scrape_with_playwright(cfg: Dict[str, Any], license_number: str) -> D
             ms = (int(m.group(1)) if m else random.randint(1,3)) * 1000
             await page.wait_for_timeout(ms)
 
-        # Fill input if provided
-        field_name = cfg.get("INPUT_FIELD_NAME") or ""
-        search_btn_id = cfg.get("SEARCH_BUTTON_ID") or ""
+        # Fill, submit, then click into details
+        await _fill_and_search(page, cfg, license_number)
 
-        filled = False
-        if field_name:
-            try:
-                await page.fill(f"input[name=\"{field_name}\"]", license_number)
-                filled = True
-            except Exception:
-                filled = False
-
-        if not filled:
-            for sel in ["input[name*=license i]", "input[id*=license i]", "input[name*=lic i]", "input[type='text']"]:
-                try:
-                    loc = page.locator(sel).first
-                    if await loc.count() > 0:
-                        await loc.fill(license_number)
-                        filled = True
-                        break
-                except Exception:
-                    continue
-
-        # Submit
-        clicked = False
-        if search_btn_id:
-            try:
-                await page.click(f"#{search_btn_id}")
-                clicked = True
-            except Exception:
-                clicked = False
-        if not clicked:
-            for sel in ["button:has-text('Search')", "input[type='submit']", "button[type='submit']", "button:has-text('Go')"]:
-                try:
-                    if await page.locator(sel).count() > 0:
-                        await page.click(sel)
-                        clicked = True
-                        break
-                except Exception:
-                    continue
-
-        # Click into details (generic)
         try:
             await page.wait_for_load_state("networkidle", timeout=15000)
         except Exception:
             pass
+
         await _navigate_to_detail_if_needed(page, cfg, license_number)
 
         # Screenshot
