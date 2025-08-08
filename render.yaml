@@ -1,3 +1,4 @@
+# render.yaml - Fixed deployment configuration
 services:
   - type: web
     name: contractor-verifier
@@ -11,5 +12,5 @@ services:
     envVars:
       - key: PLAYWRIGHT_BROWSERS_PATH
         value: "0"
-pip install --upgrade pip && pip install -r requirements.txt && python -m playwright install --with-deps chromium
-
+      - key: PYTHONPATH
+        value: "."
