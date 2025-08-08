@@ -242,10 +242,6 @@ async def _extract_with_xpath_from_text(html_text: str, cfg: Dict[str, Any]) -> 
         "status": _xpath_try(tree, cfg.get("STATUS_XPATH", "")),
         "expires": _xpath_try(tree, cfg.get("EXPIRES_XPATH", "")),
     }
-        
-    except Exception as e:
-        print(f"Oregon business name extraction error: {e}")
-        return "Error extracting business name"
 
 # ---- Hard overrides for brittle portals (used if CSV is wrong) ----
 # In your scraper.py, update the OVERRIDES section to force Oregon to use Playwright:
