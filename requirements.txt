@@ -3,6 +3,5 @@ uvicorn
 aiohttp
 requests
 beautifulsoup4
-playwright
 pydantic
 lxml
