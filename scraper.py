@@ -230,7 +230,15 @@ async def _extract_with_xpath_from_text(html_text: str, cfg: Dict[str, Any]) -> 
                 "status": "Unknown", 
                 "expires": None
             }
-    
+    def _apply_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    st = cfg.get("STATE")
+    if not st or st not in OVERRIDES:
+        return cfg
+    out = dict(cfg)
+    for k, v in OVERRIDES[st].items():
+        if v is not None:
+            out[k] = v
+    return out
     # Standard extraction for other states (unchanged)
     try:
         tree = html.fromstring(html_text)
