@@ -90,13 +90,12 @@ if os.getenv("DISABLE_PLAYWRIGHT") == "1":
 
 # ---- Hard overrides for brittle portals (used if CSV is wrong) ----
 OVERRIDES: Dict[str, Dict[str, Any]] = {
-    # Oregon CCB — result list then detail page
     "OR": {
         "REQUIRES_JAVASCRIPT": True,
-        # Try both the header-following bold and the table-based path
-        "BUSINESS_NAME_XPATH": "(//h1[contains(.,'CCB License Summary')]/following::*[self::b or self::strong or self::span])[1] || //td[normalize-space()='License #:']/preceding::b[1]",
-        "STATUS_XPATH": "//td[normalize-space()='Status:']/following-sibling::td[1]",
-        "EXPIRES_XPATH": "//td[normalize-space()='Expires:']/following-sibling::td[1]",
+        # Try to get business name from the heading or nearby text
+        "BUSINESS_NAME_XPATH": "//h1[contains(text(),'CCB License Summary:')]/text() | //h1/following::text()[contains(.,'COMPANY') or contains(.,'INC')][1]",
+        "STATUS_XPATH": "//td[text()='Status:']/following-sibling::td[1]/text()",
+        "EXPIRES_XPATH": "//td[text()='First Licensed:']/following-sibling::td[1]/text()",
     },
 }
 
