@@ -84,18 +84,70 @@ try:
 except Exception:
     PLAYWRIGHT_AVAILABLE = False
 
-# Allow disabling PW at runtime for “safe mode”
+# Allow disabling PW at runtime for "safe mode"
 if os.getenv("DISABLE_PLAYWRIGHT") == "1":
     PLAYWRIGHT_AVAILABLE = False
 
+# ===== Oregon-specific extraction function =====
+def extract_oregon_business_name(html_content: str) -> str:
+    """Extract business name from Oregon CCB page structure"""
+    try:
+        tree = html.fromstring(html_content)
+        
+        # Method 1: Extract from the H1 heading directly
+        # Oregon CCB pages often have "CCB License Summary: BUSINESS NAME"
+        h1_elements = tree.xpath("//h1[contains(text(), 'CCB License Summary')]")
+        for h1 in h1_elements:
+            text = h1.text_content().strip()
+            if ':' in text:
+                parts = text.split(':', 1)
+                if len(parts) > 1:
+                    business_name = parts[1].strip()
+                    if business_name and len(business_name) > 2:
+                        return business_name
+        
+        # Method 2: Look for business name patterns in the page
+        all_text = tree.text_content()
+        
+        # Common business name patterns
+        business_patterns = [
+            r'\b([A-Z][A-Z\s&\.]+(?:COMPANY|INC|LLC|CORP|CO\.?))\b',
+            r'\b([A-Z\s&]+(?:CONSTRUCTION|CONTRACTORS?|BUILDERS?)(?:\s+(?:INC|LLC|CORP|CO\.?))?)\b'
+        ]
+        
+        for pattern in business_patterns:
+            matches = re.findall(pattern, all_text)
+            for match in matches:
+                match = match.strip()
+                # Skip common false positives
+                if (len(match) > 5 and 
+                    not any(skip in match.upper() for skip in ['BOARD', 'STATE', 'OREGON', 'CCB', 'LICENSE'])):
+                    return match
+        
+        # Method 3: Look for text between specific markers
+        text_after_summary = tree.xpath("//h1[contains(text(), 'CCB License Summary')]/following::text()[normalize-space()]")
+        for text in text_after_summary[:10]:  # Check first 10 text nodes
+            text = text.strip()
+            if (len(text) > 5 and 
+                any(word in text.upper() for word in ['COMPANY', 'INC', 'LLC', 'CORP', 'CONSTRUCTION', 'CONTRACTOR']) and
+                not text.upper().startswith(('ABOUT', 'LICENSE', 'STATUS'))):
+                return text
+                
+        return "License Search"  # Fallback
+        
+    except Exception as e:
+        print(f"Oregon business name extraction error: {e}")
+        return "Error extracting business name"
+
 # ---- Hard overrides for brittle portals (used if CSV is wrong) ----
 OVERRIDES: Dict[str, Dict[str, Any]] = {
+    # Oregon CCB — result list then detail page
     "OR": {
         "REQUIRES_JAVASCRIPT": True,
-        # Try to get business name from the heading or nearby text
+        # Oregon business name appears as heading after "CCB License Summary:"
         "BUSINESS_NAME_XPATH": "//h1[contains(text(),'CCB License Summary:')]/text() | //h1/following::text()[contains(.,'COMPANY') or contains(.,'INC')][1]",
-        "STATUS_XPATH": "//td[text()='Status:']/following-sibling::td[1]/text()",
-        "EXPIRES_XPATH": "//td[text()='First Licensed:']/following-sibling::td[1]/text()",
+        "STATUS_XPATH": "//td[normalize-space(text())='Status:']/following-sibling::td[1]/text()",
+        "EXPIRES_XPATH": "//td[normalize-space(text())='First Licensed:']/following-sibling::td[1]/text()",
     },
 }
 
@@ -176,7 +228,7 @@ def _validate_format_with_regex(regex: str, license_number: str) -> bool:
     try:
         return re.match(regex, license_number) is not None
     except re.error:
-        return True  # bad regex in CSV → don’t block
+        return True  # bad regex in CSV → don't block
 
 # ===== Extraction helpers =====
 def _xpath_try(tree, xpath_expr: str) -> Optional[str]:
@@ -198,10 +250,36 @@ def _xpath_try(tree, xpath_expr: str) -> Optional[str]:
     return None
 
 async def _extract_with_xpath_from_text(html_text: str, cfg: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    """Extract data with special Oregon handling"""
+    
+    # Special case for Oregon
+    if cfg.get("STATE", "").upper() == "OR":
+        business_name = extract_oregon_business_name(html_text)
+        
+        # Extract status and other info normally
+        try:
+            tree = html.fromstring(html_text)
+            status = _xpath_try(tree, "//td[normalize-space(text())='Status:']/following-sibling::td[1]/text()")
+            expires = _xpath_try(tree, "//td[normalize-space(text())='First Licensed:']/following-sibling::td[1]/text()")
+            
+            return {
+                "business_name": business_name,
+                "status": status or "Unknown",
+                "expires": f"First Licensed: {expires}" if expires else None
+            }
+        except Exception:
+            return {
+                "business_name": business_name,
+                "status": "Unknown", 
+                "expires": None
+            }
+    
+    # Standard extraction for other states
     try:
         tree = html.fromstring(html_text)
     except Exception:
         return {"business_name": None, "status": None, "expires": None}
+    
     return {
         "business_name": _xpath_try(tree, cfg.get("BUSINESS_NAME_XPATH", "")),
         "status": _xpath_try(tree, cfg.get("STATUS_XPATH", "")),
@@ -504,7 +582,7 @@ async def verify_license(state: str, license_number: Optional[str] = None, busin
 
     # Force Playwright for result-list states (OR if CSV says JS)
     requires_js = bool(cfg.get("REQUIRES_JAVASCRIPT")) or (state_code in FORCE_JS_STATES)
-    if requires_js:
+    if requires_js and PLAYWRIGHT_AVAILABLE:
         result = await _scrape_with_playwright(cfg, norm_license)
     else:
         result = await _scrape_with_requests(cfg, norm_license)
