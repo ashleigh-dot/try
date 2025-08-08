@@ -2,15 +2,17 @@ services:
   - type: web
     name: contractor-verifier
     runtime: python
-    plan: starter  # Free tier
+    plan: starter
     buildCommand: |
+      pip install --upgrade pip &&
       pip install -r requirements.txt &&
-      python -m playwright install chromium &&
-      python -m playwright install-deps
+      python -m playwright install chromium --with-deps
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: PLAYWRIGHT_BROWSERS_PATH
         value: /opt/render/.cache/ms-playwright
       - key: DISABLE_PLAYWRIGHT
         value: "0"
+      - key: PYTHONPATH
+        value: /opt/render/project/src
     autoDeploy: true
