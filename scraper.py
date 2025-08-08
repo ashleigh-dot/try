@@ -67,6 +67,32 @@ def load_state_configs() -> Dict[str, Dict[str, Any]]:
     return configs
 
 STATE_CONFIGS: Dict[str, Dict[str, Any]] = load_state_configs()
+# ---- Hard overrides for brittle portals (used if CSV is wrong) ----
+OVERRIDES: Dict[str, Dict[str, Any]] = {
+    # Oregon Construction Contractors Board
+    "OR": {
+        "REQUIRES_JAVASCRIPT": True,
+        # multiple fallbacks with ||
+        "BUSINESS_NAME_XPATH": "(//h1[contains(.,'CCB License Summary')]/following::*[self::b or self::strong or self::span])[1] || //td[normalize-space()='License #:']/preceding::b[1]",
+        "STATUS_XPATH": "//td[normalize-space()='Status:']/following-sibling::td[1]",
+        "EXPIRES_XPATH": "//td[normalize-space()='Expires:']/following-sibling::td[1]",
+        # optional: form hints if CSV is missing
+        "INPUT_FIELD_NAME": None,    # keep CSV if present
+        "SEARCH_BUTTON_ID": None,    # keep CSV if present
+    },
+    # Add more as needed (MA, NJ, NV, PA, etc.)
+}
+
+def _apply_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """If we have hard overrides for a state, merge them onto the CSV config."""
+    st = cfg.get("STATE")
+    if not st or st not in OVERRIDES:
+        return cfg
+    out = dict(cfg)
+    for k, v in OVERRIDES[st].items():
+        if v is not None:
+            out[k] = v
+    return out
 
 # ===== Optional Playwright =====
 PLAYWRIGHT_AVAILABLE = False
@@ -86,6 +112,7 @@ FORCE_JS_STATES = {
     "NC","NE","NM","NY","OH","OK","TN","TX","VA","WI","GA","CA","FL","ID","IA","KS","KY",
     "ME","MO","MS","MT","NH","RI","SD","VT","WV","WY","ND","CO","AR","AL"
 }
+
 
 # ===== Utilities expected by main.py =====
 def get_system_status() -> Dict[str, Any]:
@@ -410,12 +437,45 @@ async def verify_license(state: str, license_number: Optional[str] = None, busin
     if not state or not license_number:
         raise ValueError("State and license_number are required")
 
-    state_code = state.upper()
-    cfg = STATE_CONFIGS.get(state_code)
-    if not cfg:
-        return {"status": "Unsupported", "message": f"State {state_code} not supported", "verified": False}
+   cfg = STATE_CONFIGS.get(state_code)
+if not cfg:
+    return {"status": "Unsupported", "message": f"State {state_code} not supported", "verified": False}
 
-    norm_license = normalize_license_number(state_code, license_number)
+# apply hard overrides (fixes brittle states even if CSV is wrong)
+cfg = _apply_overrides(cfg)
+
+norm_license = normalize_license_number(state_code, license_number)
+
+# SOFT validation only
+regex = cfg.get("LICENSE_REGEX") or ""
+format_valid = _validate_format_with_regex(regex, norm_license) if regex else True
+
+cache_key = f"{state_code}:{norm_license}"
+try:
+    cached = get_cached_result(cache_key)
+    if cached:
+        cached["from_cache"] = True
+        cached["format_valid"] = format_valid
+        return cached
+except Exception:
+    pass
+
+# force Playwright for list-first states (AND if CSV says JS)
+requires_js = bool(cfg.get("REQUIRES_JAVASCRIPT")) or (state_code in FORCE_JS_STATES)
+if requires_js:
+    result = await _scrape_with_playwright(cfg, norm_license)
+else:
+    result = await _scrape_with_requests(cfg, norm_license)
+
+result["format_valid"] = format_valid
+
+try:
+    store_result(cache_key, result)
+except Exception:
+    pass
+
+return result
+
 
     # SOFT validation: warn but DO NOT block scraping
     regex = cfg.get("LICENSE_REGEX") or ""
