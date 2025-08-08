@@ -1,9 +1,4 @@
 #!/bin/bash
-set -e
-
-echo "==> Installing Python dependencies..."
-pip install --upgrade pip
+echo "Installing dependencies..."
 pip install -r requirements.txt
-
-echo "==> Build completed successfully!"
-echo "Using requests-based scraping (Playwright disabled for deployment)"
+echo "Done!"
