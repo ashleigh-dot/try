@@ -255,7 +255,17 @@ OVERRIDES: Dict[str, Dict[str, Any]] = {
         "EXPIRES_XPATH": "//td[normalize-space(text())='First Licensed:']/following-sibling::td[1]/text()",
     },
 }
+# Add this function to your scraper.py (put it after the OVERRIDES definition):
 
+def _apply_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    st = cfg.get("STATE")
+    if not st or st not in OVERRIDES:
+        return cfg
+    out = dict(cfg)
+    for k, v in OVERRIDES[st].items():
+        if v is not None:
+            out[k] = v
+    return out
 # Also update the logic in verify_license function:
 async def verify_license(state: str, license_number: Optional[str] = None, business_name: Optional[str] = None) -> Dict[str, Any]:
     if not state or not license_number:
@@ -277,7 +287,17 @@ async def verify_license(state: str, license_number: Optional[str] = None, busin
             "message": f"State {state_code} not supported or CSV not loaded",
             "verified": False,
         }
+# Add this near the top of your scraper.py (after the STATE_CONFIGS loading):
 
+OVERRIDES: Dict[str, Dict[str, Any]] = {
+    # Oregon CCB — requires click-through from search results to detail page
+    "OR": {
+        "REQUIRES_JAVASCRIPT": True,  # Force Playwright for Oregon
+        "BUSINESS_NAME_XPATH": "//h1[contains(text(),'CCB License Summary:')]/text() | //h1/following::text()[contains(.,'COMPANY') or contains(.,'INC')][1]",
+        "STATUS_XPATH": "//td[normalize-space(text())='Status:']/following-sibling::td[1]/text()",
+        "EXPIRES_XPATH": "//td[normalize-space(text())='First Licensed:']/following-sibling::td[1]/text()",
+    },
+}
     # apply overrides (fix brittle states even if CSV is wrong)
     cfg = _apply_overrides(cfg)
 
