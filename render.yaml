@@ -1,10 +1,18 @@
+# render.yaml - COMPLETELY CLEAN VERSION
+# Replace your entire render.yaml with this
+
 services:
   - type: web
     name: contractor-verifier
     runtime: python
     plan: free
-    buildCommand: ./build.sh
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
+      echo "Skipping Playwright for now - will use requests fallback"
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
     envVars:
-      - key: PLAYWRIGHT_BROWSERS_PATH
-        value: "0"
+      - key: DISABLE_PLAYWRIGHT
+        value: "1"
+      - key: PYTHONPATH
+        value: "."
