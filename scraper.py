@@ -248,27 +248,170 @@ async def _extract_with_xpath_from_text(html_text: str, cfg: Dict[str, Any]) -> 
         return "Error extracting business name"
 
 # ---- Hard overrides for brittle portals (used if CSV is wrong) ----
+# In your scraper.py, update the OVERRIDES section to force Oregon to use Playwright:
+
 OVERRIDES: Dict[str, Dict[str, Any]] = {
-    # Oregon CCB — result list then detail page
+    # Oregon CCB — requires click-through from search results to detail page
     "OR": {
-        "REQUIRES_JAVASCRIPT": True,
-        # Oregon business name appears as heading after "CCB License Summary:"
+        "REQUIRES_JAVASCRIPT": True,  # Force Playwright for Oregon
         "BUSINESS_NAME_XPATH": "//h1[contains(text(),'CCB License Summary:')]/text() | //h1/following::text()[contains(.,'COMPANY') or contains(.,'INC')][1]",
         "STATUS_XPATH": "//td[normalize-space(text())='Status:']/following-sibling::td[1]/text()",
         "EXPIRES_XPATH": "//td[normalize-space(text())='First Licensed:']/following-sibling::td[1]/text()",
     },
 }
 
-def _apply_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    st = cfg.get("STATE")
-    if not st or st not in OVERRIDES:
-        return cfg
-    out = dict(cfg)
-    for k, v in OVERRIDES[st].items():
-        if v is not None:
-            out[k] = v
-    return out
+# Also update the logic in verify_license function:
+async def verify_license(state: str, license_number: Optional[str] = None, business_name: Optional[str] = None) -> Dict[str, Any]:
+    if not state or not license_number:
+        raise ValueError("State and license_number are required")
 
+    state_code = _resolve_state_code(state)
+    if not state_code:
+        return {"status": "Unsupported", "message": "Missing or invalid state", "verified": False}
+
+    # Defensive lookup (case-insensitive)
+    cfg = (
+        STATE_CONFIGS.get(state_code)
+        or STATE_CONFIGS.get(state_code.lower())
+        or STATE_CONFIGS.get((state_code or "").strip())
+    )
+    if not cfg:
+        return {
+            "status": "Unsupported",
+            "message": f"State {state_code} not supported or CSV not loaded",
+            "verified": False,
+        }
+
+    # apply overrides (fix brittle states even if CSV is wrong)
+    cfg = _apply_overrides(cfg)
+
+    norm_license = normalize_license_number(state_code, license_number)
+
+    # Format validation
+    regex = cfg.get("LICENSE_REGEX") or ""
+    format_valid = _validate_format_with_regex(regex, norm_license) if regex else True
+
+    cache_key = f"{state_code}:{norm_license}"
+    try:
+        cached = get_cached_result(cache_key)
+        if cached:
+            cached["from_cache"] = True
+            cached["format_valid"] = format_valid
+            return cached
+    except Exception:
+        pass
+
+    # FORCE PLAYWRIGHT FOR OREGON - it requires clicking through search results
+    requires_js = bool(cfg.get("REQUIRES_JAVASCRIPT")) or (state_code in FORCE_JS_STATES)
+    
+    # Special handling for Oregon - always try Playwright first if available
+    if state_code == "OR" and PLAYWRIGHT_AVAILABLE:
+        print(f"DEBUG: Using Playwright for Oregon license {norm_license}")
+        result = await _scrape_with_playwright(cfg, norm_license)
+    elif requires_js and PLAYWRIGHT_AVAILABLE:
+        result = await _scrape_with_playwright(cfg, norm_license)
+    else:
+        print(f"DEBUG: Using requests for {state_code} (Playwright available: {PLAYWRIGHT_AVAILABLE})")
+        result = await _scrape_with_requests(cfg, norm_license)
+
+    result["format_valid"] = format_valid
+
+    try:
+        store_result(cache_key, result)
+    except Exception:
+        pass
+
+    return result
+
+# Update the Playwright navigation function to better handle Oregon:
+async def _navigate_to_detail_if_needed(page, cfg: Dict[str, Any], license_number: str):
+    """
+    Generic 'click into details' navigator for result lists.
+    Enhanced for Oregon CCB specifically.
+    """
+    state = cfg.get("STATE", "").upper()
+    
+    try:
+        # Check if already on a detail page
+        detail_markers = [
+            "License Summary", "License Details", "Detail", "Licensee Details",
+            "CCB License Summary", "License Information", "License Number:"
+        ]
+        for marker in detail_markers:
+            if await page.locator(f"text={marker}").count() > 0:
+                print(f"DEBUG: Already on detail page (found: {marker})")
+                return
+    except Exception:
+        pass
+
+    print(f"DEBUG: Looking for ways to navigate to detail page for license {license_number}")
+
+    # Oregon-specific: Look for the license number in search results
+    if state == "OR":
+        try:
+            # Wait a moment for results to load
+            await page.wait_for_timeout(2000)
+            
+            # Try clicking on the license number in search results
+            license_selectors = [
+                f"a:has-text('{license_number}')",
+                f"td:has-text('{license_number}') + td a",
+                f"tr:has-text('{license_number}') a",
+                "table tr:first-child a",  # First result
+            ]
+            
+            for selector in license_selectors:
+                try:
+                    if await page.locator(selector).count() > 0:
+                        print(f"DEBUG: Clicking Oregon license link: {selector}")
+                        await page.click(selector)
+                        await page.wait_for_load_state("networkidle", timeout=10000)
+                        return
+                except Exception as e:
+                    print(f"DEBUG: Failed to click {selector}: {e}")
+                    continue
+                    
+        except Exception as e:
+            print(f"DEBUG: Oregon-specific navigation failed: {e}")
+
+    # Generic click-through logic (existing code)
+    # 1) Exact license number text/link
+    try:
+        sel = f"text='{license_number}'"
+        if await page.locator(sel).count() > 0:
+            print(f"DEBUG: Clicking exact license number: {sel}")
+            await page.click(sel)
+            await page.wait_for_load_state("networkidle", timeout=15000)
+            return
+    except Exception:
+        pass
+
+    # 2) Common "Details" actions
+    for sel in ["a:has-text('Details')", "button:has-text('Details')",
+                "a:has-text('More')", "button:has-text('More')",
+                "a:has-text('View')", "button:has-text('View')"]:
+        try:
+            if await page.locator(sel).count() > 0:
+                print(f"DEBUG: Clicking details button: {sel}")
+                await page.click(sel)
+                await page.wait_for_load_state("networkidle", timeout=15000)
+                return
+        except Exception:
+            continue
+
+    # 3) First link in a grid/table of results
+    for sel in ["table a", "table tbody tr a", "[role='grid'] a", ".results a", ".table a"]:
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() > 0:
+                print(f"DEBUG: Clicking first table link: {sel}")
+                await loc.click()
+                await page.wait_for_load_state("networkidle", timeout=15000)
+                return
+        except Exception:
+            continue
+            
+    print("DEBUG: No clickable elements found for navigation")
 # Many states show a results table first → force JS to allow clicking into details
 FORCE_JS_STATES = {
     "OR","MA","NJ","NV","PA","SC","AZ","WA","UT","CT","DE","IL","IN","LA","MD","MI","MN",
