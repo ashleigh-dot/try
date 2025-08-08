@@ -1,8 +1,9 @@
 #!/bin/bash
-# CLEAN build.sh - no complex Python commands
+set -e
 
-echo "Installing Python dependencies..."
+echo "==> Installing Python dependencies..."
 pip install --upgrade pip
 pip install -r requirements.txt
 
-echo "Build complete - using requests fallback for web scraping"
+echo "==> Build completed successfully!"
+echo "Using requests-based scraping (Playwright disabled for deployment)"
