@@ -35,7 +35,7 @@ except ImportError as e:
 
 app = FastAPI(
     title="Contractor License Verification API", 
-    version="4.0-simplified",
+    version="4.0-render",
     description="Real-time contractor license verification (Render-optimized version)"
 )
 
@@ -64,8 +64,8 @@ class BatchRequest(BaseModel):
     
     @validator('requests')
     def validate_batch_size(cls, v):
-        if len(v) > 20:  # Reduced batch size for free tier
-            raise ValueError('Batch size cannot exceed 20 requests on free tier')
+        if len(v) > 10:  # Reduced for Render stability
+            raise ValueError('Batch size cannot exceed 10 requests')
         return v
 
 @app.get("/")
@@ -74,7 +74,7 @@ async def root():
     try:
         system_status = get_system_status()
         return {
-            "message": "Contractor License Verification API v4.0",
+            "message": "Contractor License Verification API v4.0-render",
             "status": "active",
             "supported_states": len(STATE_CONFIGS),
             "system_info": system_status,
@@ -90,7 +90,7 @@ async def root():
     except Exception as e:
         logger.error(f"Error in root endpoint: {e}")
         return {
-            "message": "Contractor License Verification API v4.0",
+            "message": "Contractor License Verification API v4.0-render",
             "status": "limited",
             "error": "Some features may be unavailable"
         }
@@ -100,8 +100,9 @@ async def health_check():
     """Health check endpoint"""
     return {
         "status": "healthy", 
-        "timestamp": "2025-08-07",
-        "environment": "render" if os.environ.get("RENDER") else "local"
+        "timestamp": "2025-08-08",
+        "environment": "render" if os.environ.get("RENDER") else "local",
+        "python_version": os.environ.get("PYTHON_VERSION", "unknown")
     }
 
 @app.post("/verify")
@@ -206,9 +207,9 @@ async def get_examples():
         examples = {}
         for state, config in STATE_CONFIGS.items():
             examples[state] = {
-                "example": config.get("example", "Contact state for format"),
-                "format": config.get("format", "Varies"),
-                "type": config.get("type", "Professional License")
+                "example": config.get("EXAMPLE_LICENSE", "Contact state for format"),
+                "format": config.get("LICENSE_REGEX", "Varies"),
+                "type": config.get("LICENSE_TYPE", "Professional License")
             }
         return examples
     except Exception as e:
@@ -228,7 +229,8 @@ async def debug_info():
                 "RENDER": os.environ.get("RENDER", "Not set"),
                 "PLAYWRIGHT_BROWSERS_PATH": os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "Not set")
             },
-            "supported_states_count": len(STATE_CONFIGS)
+            "supported_states_count": len(STATE_CONFIGS),
+            "csv_file_exists": os.path.exists("contractor_license_verification_database.csv")
         }
     except Exception as e:
         return {"error": f"Debug info error: {e}"}
