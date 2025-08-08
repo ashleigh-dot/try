@@ -3,6 +3,7 @@ import csv
 import random
 import re
 import base64
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, List, Optional
@@ -75,6 +76,17 @@ try:
 except Exception:
     PLAYWRIGHT_AVAILABLE = False
 
+# Allow disabling PW at runtime for “safe mode”
+if os.getenv("DISABLE_PLAYWRIGHT") == "1":
+    PLAYWRIGHT_AVAILABLE = False
+
+# Many states show a results table first → force JS to allow clicking into details
+FORCE_JS_STATES = {
+    "OR","MA","NJ","NV","PA","SC","AZ","WA","UT","CT","DE","IL","IN","LA","MD","MI","MN",
+    "NC","NE","NM","NY","OH","OK","TN","TX","VA","WI","GA","CA","FL","ID","IA","KS","KY",
+    "ME","MO","MS","MT","NH","RI","SD","VT","WV","WY","ND","CO","AR","AL"
+}
+
 # ===== Utilities expected by main.py =====
 def get_system_status() -> Dict[str, Any]:
     return {
@@ -88,7 +100,7 @@ def normalize_license_number(state: str, license_number: str) -> str:
     if not license_number:
         return license_number
     num = license_number.strip().upper()
-    # keep dots/dashes if part of format; but remove spaces
+    # keep dots/dashes if part of format; remove spaces
     num = re.sub(r"\s+", "", num)
     return num
 
@@ -137,12 +149,11 @@ def _validate_format_with_regex(regex: str, license_number: str) -> bool:
     try:
         return re.match(regex, license_number) is not None
     except re.error:
-        # bad regex in CSV; don't block user
-        return True
+        return True  # bad regex in CSV → don’t block
 
 # ===== Extraction helpers =====
 def _xpath_try(tree, xpath_expr: str) -> Optional[str]:
-    """Support multiple XPaths separated by '||'. Return first match text."""
+    """Support multiple XPaths separated by '||'. Return first matched text."""
     if not xpath_expr:
         return None
     for candidate in [s.strip() for s in xpath_expr.split("||") if s.strip()]:
@@ -151,10 +162,7 @@ def _xpath_try(tree, xpath_expr: str) -> Optional[str]:
             if not nodes:
                 continue
             node = nodes[0]
-            if isinstance(node, str):
-                val = node
-            else:
-                val = node.text_content()
+            val = node if isinstance(node, str) else node.text_content()
             val = (val or "").strip()
             if val:
                 return val
@@ -241,11 +249,11 @@ async def _navigate_to_detail_if_needed(page, cfg: Dict[str, Any], license_numbe
     Tries several common patterns:
       - link/text that exactly matches the license number
       - buttons/links labeled 'Details', 'More', 'View'
-      - first link inside a results table/grid
+      - the first link inside a results table/grid
     Safe to call multiple times; it no-ops if already on detail page.
     """
     try:
-        # If detail markers already present (common phrases), skip
+        # If detail markers already present, skip
         detail_markers = [
             "License Summary", "License Details", "Detail", "Licensee Details",
             "CCB License Summary", "License Information", "License Number:"
@@ -256,7 +264,7 @@ async def _navigate_to_detail_if_needed(page, cfg: Dict[str, Any], license_numbe
     except Exception:
         pass
 
-    # 1) Exact license number link
+    # 1) Exact license number text/link
     try:
         sel = f"text='{license_number}'"
         if await page.locator(sel).count() > 0:
@@ -266,7 +274,7 @@ async def _navigate_to_detail_if_needed(page, cfg: Dict[str, Any], license_numbe
     except Exception:
         pass
 
-    # 2) Common 'Details' buttons/links
+    # 2) Common "Details" actions
     for sel in ["a:has-text('Details')", "button:has-text('Details')",
                 "a:has-text('More')", "button:has-text('More')",
                 "a:has-text('View')", "button:has-text('View')"]:
@@ -357,7 +365,7 @@ async def _scrape_with_playwright(cfg: Dict[str, Any], license_number: str) -> D
                 except Exception:
                     continue
 
-        # Generic "click into details" for ALL states (if needed)
+        # Click into details (generic)
         try:
             await page.wait_for_load_state("networkidle", timeout=15000)
         except Exception:
@@ -418,20 +426,19 @@ async def verify_license(state: str, license_number: Optional[str] = None, busin
         cached = get_cached_result(cache_key)
         if cached:
             cached["from_cache"] = True
-            # preserve format_valid hint
             cached["format_valid"] = format_valid
             return cached
     except Exception:
         pass
 
-    if cfg.get("REQUIRES_JAVASCRIPT"):
+    # Force Playwright for result-list states (or if CSV says requires JS)
+    requires_js = bool(cfg.get("REQUIRES_JAVASCRIPT")) or (state_code in FORCE_JS_STATES)
+    if requires_js:
         result = await _scrape_with_playwright(cfg, norm_license)
     else:
         result = await _scrape_with_requests(cfg, norm_license)
 
-    # include soft validation flag
     result["format_valid"] = format_valid
-
     try:
         store_result(cache_key, result)
     except Exception:
