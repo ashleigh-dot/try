@@ -88,52 +88,160 @@ except Exception:
 if os.getenv("DISABLE_PLAYWRIGHT") == "1":
     PLAYWRIGHT_AVAILABLE = False
 
-# ===== Oregon-specific extraction function =====
+# Updated Oregon extraction function for scraper.py
+# Replace the extract_oregon_business_name function with this:
+
 def extract_oregon_business_name(html_content: str) -> str:
     """Extract business name from Oregon CCB page structure"""
     try:
         tree = html.fromstring(html_content)
         
-        # Method 1: Extract from the H1 heading directly
-        # Oregon CCB pages often have "CCB License Summary: BUSINESS NAME"
-        h1_elements = tree.xpath("//h1[contains(text(), 'CCB License Summary')]")
+        # Method 1: Extract from the H1 heading - "CCB License Summary: BUSINESS NAME"
+        h1_elements = tree.xpath("//h1")
         for h1 in h1_elements:
             text = h1.text_content().strip()
-            if ':' in text:
-                parts = text.split(':', 1)
+            print(f"DEBUG: H1 text found: '{text}'")  # Debug line
+            
+            # Look for the pattern "CCB License Summary:" followed by business name
+            if 'CCB License Summary:' in text:
+                # Split on the colon and get everything after it
+                parts = text.split('CCB License Summary:', 1)
                 if len(parts) > 1:
                     business_name = parts[1].strip()
                     if business_name and len(business_name) > 2:
+                        print(f"DEBUG: Extracted business name from H1: '{business_name}'")
                         return business_name
         
-        # Method 2: Look for business name patterns in the page
-        all_text = tree.text_content()
+        # Method 2: Look for the business name as the next text element after the H1
+        # Sometimes it's in a separate element right after the heading
+        h1_summary = tree.xpath("//h1[contains(text(), 'CCB License Summary')]")
+        if h1_summary:
+            # Get all text nodes that follow the summary heading
+            following_text = tree.xpath("//h1[contains(text(), 'CCB License Summary')]/following::text()[normalize-space()]")
+            for i, text in enumerate(following_text[:5]):  # Check first 5 text nodes
+                text = text.strip()
+                print(f"DEBUG: Following text {i}: '{text}'")
+                
+                # Skip common non-business text
+                if (text and len(text) > 3 and 
+                    not text.lower().startswith(('about', 'license', 'status', 'first', 'unpaid', 'complaint', 'disciplinary', 'administrative')) and
+                    not text.isdigit()):
+                    
+                    # Check if it looks like a business name
+                    if (any(word in text.upper() for word in ['COMPANY', 'INC', 'LLC', 'CORP', 'CO', 'CONSTRUCTION', 'CONTRACTOR', '&']) or
+                        (len(text) > 10 and all(c.isalpha() or c.isspace() or c in '&-.' for c in text))):
+                        print(f"DEBUG: Found business name in following text: '{text}'")
+                        return text
         
-        # Common business name patterns
-        business_patterns = [
-            r'\b([A-Z][A-Z\s&\.]+(?:COMPANY|INC|LLC|CORP|CO\.?))\b',
-            r'\b([A-Z\s&]+(?:CONSTRUCTION|CONTRACTORS?|BUILDERS?)(?:\s+(?:INC|LLC|CORP|CO\.?))?)\b'
-        ]
-        
-        for pattern in business_patterns:
-            matches = re.findall(pattern, all_text)
-            for match in matches:
-                match = match.strip()
-                # Skip common false positives
-                if (len(match) > 5 and 
-                    not any(skip in match.upper() for skip in ['BOARD', 'STATE', 'OREGON', 'CCB', 'LICENSE'])):
-                    return match
-        
-        # Method 3: Look for text between specific markers
-        text_after_summary = tree.xpath("//h1[contains(text(), 'CCB License Summary')]/following::text()[normalize-space()]")
-        for text in text_after_summary[:10]:  # Check first 10 text nodes
+        # Method 3: Look for any text that contains business-like patterns
+        all_text_nodes = tree.xpath("//text()[normalize-space()]")
+        for text in all_text_nodes:
             text = text.strip()
             if (len(text) > 5 and 
-                any(word in text.upper() for word in ['COMPANY', 'INC', 'LLC', 'CORP', 'CONSTRUCTION', 'CONTRACTOR']) and
-                not text.upper().startswith(('ABOUT', 'LICENSE', 'STATUS'))):
+                any(word in text.upper() for word in ['COMPANY INC', 'COMPANY LLC', '& COMPANY']) and
+                not any(skip in text.upper() for skip in ['BOARD', 'STATE', 'OREGON', 'CCB', 'LICENSE', 'SUMMARY'])):
+                print(f"DEBUG: Found business name via pattern matching: '{text}'")
                 return text
-                
+        
+        # Method 4: Look specifically for "B & K COMPANY INC" pattern
+        business_patterns = [
+            r'\b[A-Z]\s*&\s*[A-Z]\s+COMPANY\s+INC\b',
+            r'\b[A-Z\s&]+COMPANY\s+INC\b',
+            r'\b[A-Z][A-Z\s&]+(?:COMPANY|INC|LLC|CORP)\b'
+        ]
+        
+        page_text = tree.text_content()
+        for pattern in business_patterns:
+            matches = re.findall(pattern, page_text)
+            for match in matches:
+                match = match.strip()
+                if (len(match) > 5 and 
+                    not any(skip in match.upper() for skip in ['BOARD', 'STATE', 'OREGON', 'CCB', 'LICENSE'])):
+                    print(f"DEBUG: Found business name via regex: '{match}'")
+                    return match
+                    
+        print("DEBUG: No business name found, returning fallback")
         return "License Search"  # Fallback
+        
+    except Exception as e:
+        print(f"Oregon business name extraction error: {e}")
+        return "Error extracting business name"
+
+# Also update the _extract_with_xpath_from_text function to add debug info:
+async def _extract_with_xpath_from_text(html_text: str, cfg: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    """Extract data with special Oregon handling"""
+    
+    # Special case for Oregon
+    if cfg.get("STATE", "").upper() == "OR":
+        print("DEBUG: Processing Oregon page")
+        business_name = extract_oregon_business_name(html_text)
+        print(f"DEBUG: Final Oregon business name: '{business_name}'")
+        
+        # Extract status and other info normally
+        try:
+            tree = html.fromstring(html_text)
+            
+            # Try multiple XPath patterns for status
+            status_xpaths = [
+                "//td[normalize-space(text())='Status:']/following-sibling::td[1]/text()",
+                "//td[contains(text(),'Status')]/following-sibling::td[1]/text()",
+                "//text()[contains(.,'Not Active') or contains(.,'Active') or contains(.,'Expired')][normalize-space()][1]"
+            ]
+            
+            status = None
+            for xpath in status_xpaths:
+                try:
+                    nodes = tree.xpath(xpath)
+                    if nodes:
+                        status = nodes[0].strip()
+                        if status:
+                            break
+                except:
+                    continue
+            
+            # Try to find the expiration/first licensed date
+            expires_xpaths = [
+                "//td[normalize-space(text())='First Licensed:']/following-sibling::td[1]/text()",
+                "//td[contains(text(),'First Licensed')]/following-sibling::td[1]/text()"
+            ]
+            
+            expires = None
+            for xpath in expires_xpaths:
+                try:
+                    nodes = tree.xpath(xpath)
+                    if nodes:
+                        expires = nodes[0].strip()
+                        if expires:
+                            break
+                except:
+                    continue
+            
+            print(f"DEBUG: Oregon status: '{status}', expires: '{expires}'")
+            
+            return {
+                "business_name": business_name,
+                "status": status or "Unknown",
+                "expires": f"First Licensed: {expires}" if expires else None
+            }
+        except Exception as e:
+            print(f"DEBUG: Oregon extraction error: {e}")
+            return {
+                "business_name": business_name,
+                "status": "Unknown", 
+                "expires": None
+            }
+    
+    # Standard extraction for other states (unchanged)
+    try:
+        tree = html.fromstring(html_text)
+    except Exception:
+        return {"business_name": None, "status": None, "expires": None}
+    
+    return {
+        "business_name": _xpath_try(tree, cfg.get("BUSINESS_NAME_XPATH", "")),
+        "status": _xpath_try(tree, cfg.get("STATUS_XPATH", "")),
+        "expires": _xpath_try(tree, cfg.get("EXPIRES_XPATH", "")),
+    }
         
     except Exception as e:
         print(f"Oregon business name extraction error: {e}")
