@@ -1,9 +1,9 @@
-# render.yaml (blueprint)
+# render.yaml
 services:
   - type: web
     name: contractor-verifier
     runtime: python
-    rootDir: try-main
+    rootDir: try-main        # <— IMPORTANT if your code lives in try-main/
     plan: starter
     buildCommand: |
       pip install --upgrade pip &&
