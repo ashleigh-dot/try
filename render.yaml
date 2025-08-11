@@ -1,7 +1,9 @@
+# render.yaml (blueprint)
 services:
   - type: web
     name: contractor-verifier
     runtime: python
+    rootDir: try-main
     plan: starter
     buildCommand: |
       pip install --upgrade pip &&
@@ -15,4 +17,5 @@ services:
         value: "0"
       - key: PYTHONPATH
         value: /opt/render/project/src
+    healthCheckPath: /health
     autoDeploy: true
